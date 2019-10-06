@@ -9,7 +9,7 @@
 //!
 //! <https://ourmachinery.com/post/data-structures-part-3-arrays-of-arrays/>
 
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 
 /// Unique interned string identifier.
@@ -58,7 +58,9 @@ impl StringPool {
     pub fn intern(&mut self, string: &str) -> StringID {
         assert!(
             string.len() <= self.chunk_size as usize,
-            "Max supported interned string length in bytes is `{}` - tried to intern `{}` bytes.", self.chunk_size, string.len()
+            "Max supported interned string length in bytes is `{}` - tried to intern `{}` bytes.",
+            self.chunk_size,
+            string.len()
         );
 
         let string_id = StringID(string_hash(string));
@@ -90,8 +92,8 @@ impl StringPool {
                         self.lookup.insert(string_id, new_state);
 
                         return string_id;
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 }
             }
 
@@ -106,8 +108,8 @@ impl StringPool {
                     self.lookup.insert(string_id, new_state);
 
                     string_id
-                },
-                _ => { unreachable!() },
+                }
+                _ => unreachable!(),
             };
 
             self.chunks.push(chunk);
@@ -125,7 +127,7 @@ impl StringPool {
     pub fn lookup(&self, string_id: StringID) -> Option<&str> {
         // String was interned.
         if let Some(state) = self.lookup.get(&string_id) {
-            return Some(self.lookup_in_chunk(state.chunk_index, state.lookup_index))
+            return Some(self.lookup_in_chunk(state.chunk_index, state.lookup_index));
 
         // String was not interned, or was already removed.
         } else {
@@ -163,15 +165,24 @@ impl StringPool {
 
                         // Patch the chunk indices if necessary.
                         if last_chunk_index != chunk_index {
-                            for state in self.lookup.iter_mut().filter_map( |(_, v)| {
-                                if v.chunk_index == last_chunk_index { Some(v) } else { None }
-                            } ).collect::<Vec<&mut StringState>>() {
+                            for state in self
+                                .lookup
+                                .iter_mut()
+                                .filter_map(|(_, v)| {
+                                    if v.chunk_index == last_chunk_index {
+                                        Some(v)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<&mut StringState>>()
+                            {
                                 state.chunk_index = chunk_index;
                             }
                         }
-                    },
+                    }
 
-                    _ => {},
+                    _ => {}
                 }
             }
         }
@@ -287,10 +298,7 @@ impl StringChunk {
         let offset = self.first_free_byte;
 
         let lookup_index = self.offset_lookup.len() as u16;
-        self.offset_lookup.push(StringInChunk {
-            offset,
-            length,
-        });
+        self.offset_lookup.push(StringInChunk { offset, length });
 
         self.first_free_byte += length;
 
@@ -304,9 +312,7 @@ impl StringChunk {
         debug_assert!(self.occupied_bytes <= self.chunk_size);
 
         let src = string.as_bytes().as_ptr();
-        let dst = unsafe {
-            self.data.offset(offset as isize)
-        };
+        let dst = unsafe { self.data.offset(offset as isize) };
 
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst, length as usize);
@@ -363,7 +369,12 @@ impl StringChunk {
 
                 current_strings.push((*string_in_chunk, 0u16));
             }
-            debug_assert_eq!(current_strings.iter().fold(0, |sum, el| { sum + el.0.length }), self.occupied_bytes);
+            debug_assert_eq!(
+                current_strings
+                    .iter()
+                    .fold(0, |sum, el| { sum + el.0.length }),
+                self.occupied_bytes
+            );
 
             // Sort by offset.
             current_strings.sort_by(|l, r| l.0.offset.cmp(&r.0.offset));
@@ -401,7 +412,11 @@ impl StringChunk {
 
             // Patch the offsets.
             for (string_in_chunk, new_offset) in current_strings.iter() {
-                let found = self.offset_lookup.iter_mut().find(|el| el.offset == string_in_chunk.offset).unwrap();
+                let found = self
+                    .offset_lookup
+                    .iter_mut()
+                    .find(|el| el.offset == string_in_chunk.offset)
+                    .unwrap();
                 found.offset = *new_offset;
             }
 
@@ -426,9 +441,7 @@ fn malloc(size: usize, val: u8) -> *mut u8 {
 }
 
 fn free(ptr: *mut u8, size: usize) {
-    let vec = unsafe {
-        Vec::from_raw_parts(ptr, size, size)
-    };
+    let vec = unsafe { Vec::from_raw_parts(ptr, size, size) };
     std::mem::drop(vec);
 }
 
