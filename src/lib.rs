@@ -10,6 +10,7 @@
 //! <https://ourmachinery.com/post/data-structures-part-3-arrays-of-arrays/>
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 
 /// Unique interned string identifier.
@@ -17,8 +18,14 @@ use std::hash::{Hash, Hasher};
 /// so `StringID` equality does not guarantee string equality.
 ///
 /// [`DefaultHasher`]: https://doc.rust-lang.org/nightly/std/collections/hash_map/struct.DefaultHasher.html
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct StringID(pub u64);
+
+impl Display for StringID {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Manages the collection of unique interned strings.
 /// Uses ref-counting internally to deduplicate stored strings.
@@ -69,7 +76,7 @@ impl StringPool {
         if let Some(state) = self.lookup.get_mut(&string_id) {
             state.ref_count += 1;
 
-            // Debug-only hash collision detection j ust a panic.
+            // Debug-only hash collision detection - just a panic.
             // TODO - fix this.
             debug_assert_eq!(
                 string,
