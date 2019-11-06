@@ -87,7 +87,10 @@ pub struct UnsafeStr((*const u8, usize));
 
 impl UnsafeStr {
     /// Returns the actual interned string.
-    pub unsafe fn to_str(&self) -> &str {
+    ///
+    /// Unsafe because it's up to the user to ensure the string does not outlive the string pool
+    /// or is not invalidated.
+    pub unsafe fn to_str(&self) -> &'static str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts((self.0).0, (self.0).1))
     }
 
