@@ -69,10 +69,12 @@ impl Display for StringID {
     }
 }
 
+pub type ChunkSize = u16;
+
 /// Manages the collection of unique interned strings.
 /// Uses ref-counting internally to deduplicate stored strings.
 pub struct StringPool {
-    chunk_size: u16,
+    chunk_size: ChunkSize,
     lookup: HashMap<StringID, StringState>,
     chunks: Vec<StringChunk>,
     gc: Vec<StringID>,
@@ -99,6 +101,20 @@ impl UnsafeStr {
     }
 }
 
+#[derive(PartialEq, Debug)]
+pub enum StringPoolError {
+    /// Attempted to intern an empty (zero-length) string.
+    EmptyString,
+    /// Attempted to intern a string whose length in bytes is greater
+    /// then the maximum length supported by the string pool
+    /// (as determinded by the `chunk_size` parameter).
+    /// Contains the max string length in bytes supported by the [`StringPool`](struct.StringPool.html).
+    StringTooLong(ChunkSize),
+    /// String hash collision detected.
+    /// Contains the pair of colliding strings and their hash.
+    HashCollision((String, String, StringID)),
+}
+
 impl StringPool {
     /// Creates a new string pool.
     ///
@@ -108,7 +124,7 @@ impl StringPool {
     /// Larger chunks allow for longer strings to be stored, but may have higher memory fragmentation
     /// if the strings are frequently added and removed, as the pool makes no effort to reuse
     /// free space in chunks until it exceeds 50% of the chunks size.
-    pub fn new(chunk_size: u16) -> Self {
+    pub fn new(chunk_size: ChunkSize) -> Self {
         Self {
             chunk_size,
             lookup: HashMap::new(),
@@ -137,40 +153,30 @@ impl StringPool {
     /// If `string` was laready interned, returns the same [`StringID`] as the one returned by the previous call to `intern`,
     /// internally incrementing the string's ref count.
     ///
-    /// NOTE - empty (zero-length) strings are NOT interned, the function returns a default (null) [`StringID`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `string` length exceeds `chunk_size` bytes.
-    /// In debug mode only, panics on hash collision (same `StringID` generated for non-equal strings).
-    ///
     /// [`StringID`]: struct.StringID.html
-    pub fn intern(&mut self, string: &str) -> StringID {
-        assert!(
-            string.len() <= self.chunk_size as usize,
-            "Max supported interned string length in bytes is `{}` - tried to intern `{}` bytes.",
-            self.chunk_size,
-            string.len()
-        );
+    pub fn intern(&mut self, string: &str) -> Result<StringID, StringPoolError> {
+        let len = string.len();
 
-        if string.len() == 0 {
-            return StringID::default();
+        if len > self.chunk_size as usize {
+            return Err(StringPoolError::StringTooLong(self.chunk_size));
+        }
+
+        if len == 0 {
+            return Err(StringPoolError::EmptyString);
         }
 
         let string_id = StringID(string_hash(string));
 
         unsafe {
-            self.intern_with_id(string, string_id);
+            self.intern_with_id(string, string_id).unwrap();
         }
 
-        string_id
+        Ok(string_id)
     }
 
     /// Interns the string using the `string_id`, previously returned for `string` by the call to [`string_id`],
     /// which may be used to look it up or remove it from the pool.
     /// If `string` was laready interned, internally increments the string's ref count.
-    ///
-    /// NOTE - empty (zero-length) strings are NOT interned.
     ///
     /// NOTE - meant for use as an optimization in cases where it's possible and beneficial to split [`StringID`] calculation (hashing)
     /// and interning.
@@ -181,38 +187,43 @@ impl StringPool {
     ///
     /// # Panics
     ///
-    /// Panics if `string` length exceeds `chunk_size` bytes.
-    /// In debug mode only, panics on hash collision (same `StringID` generated for non-equal strings).
+    /// In debug mode only, panics if `string_id` does not correspond to `string`.
     ///
     /// [`string_id`]: #method.string_id
     /// [`StringID`]: struct.StringID.html
-    pub unsafe fn intern_with_id(&mut self, string: &str, string_id: StringID) {
+    pub unsafe fn intern_with_id(&mut self, string: &str, string_id: StringID) -> Result<(), StringPoolError> {
         if string.len() == 0 {
-            return;
+            return Err(StringPoolError::EmptyString);
         }
 
+        let _actual_string_id = StringPool::string_id(string);
+
         debug_assert_eq!(
-            StringPool::string_id(string),
+            _actual_string_id,
             string_id,
             "String / StringID mismatch: expected {}, found {}.",
-            StringPool::string_id(string),
+            _actual_string_id,
             string_id
         );
 
         // String was already interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
-            state.ref_count += 1;
+            // Check for hash collision.
+            let looked_up_string = StringPool::lookup_in_state(&self.chunks, state).unwrap();
 
-            // Debug-only hash collision detection - just a panic.
-            // TODO - fix this.
-            debug_assert_eq!(
-                string,
-                self.lookup(string_id).unwrap(),
-                "Hash collision detected. Interned: \"{}\", new: \"{}\", hash: [{}].",
-                self.lookup(string_id).unwrap(),
-                string,
-                string_id.0
-            );
+            if looked_up_string != string {
+                return Err(
+                    StringPoolError::HashCollision(
+                        (
+                            string.to_owned(),
+                            looked_up_string.to_owned(),
+                            string_id,
+                        )
+                    )
+                );
+            }
+
+            state.ref_count += 1;
 
         // Else the string has not been interned yet.
         } else {
@@ -242,6 +253,8 @@ impl StringPool {
 
             self.chunks.push(chunk);
         }
+
+        Ok(())
     }
 
     /// Looks up a previously [`intern`]'ed string via its [`StringID`].
@@ -251,14 +264,9 @@ impl StringPool {
     /// [`intern`]: #method.intern
     /// [`StringID`]: struct.StringID.html
     pub fn lookup(&self, string_id: StringID) -> Option<&str> {
-        // String was interned.
+        // The string was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(state) = self.lookup.get(&string_id) {
-            // If the ref count is `0`, the string was removed but not yet garbage collected.
-            if state.ref_count > 0 {
-                Some(self.lookup_in_chunk(state.chunk_index, state.lookup_index))
-            } else {
-                None
-            }
+            StringPool::lookup_in_state(&self.chunks, state)
 
         // String was not interned, or was already removed.
         } else {
@@ -365,8 +373,17 @@ impl StringPool {
         }
     }
 
-    fn lookup_in_chunk(&self, chunk_index: u16, lookup_index: u16) -> &str {
-        self.chunks[chunk_index as usize].lookup(lookup_index)
+    fn lookup_in_chunk(chunks: &[StringChunk], chunk_index: u16, lookup_index: u16) -> &str {
+        chunks[chunk_index as usize].lookup(lookup_index)
+    }
+
+    fn lookup_in_state<'a>(chunks: &'a[StringChunk], state: &StringState) -> Option<&'a str> {
+        // If the ref count is `0`, the string was removed but not yet garbage collected.
+        if state.ref_count == 0 {
+            None
+        } else {
+            Some(StringPool::lookup_in_chunk(chunks, state.chunk_index, state.lookup_index))
+        }
     }
 
     fn remove_from_chunk(
@@ -410,6 +427,7 @@ type ChunkIndex = u16;
 type LookupIndex = u16;
 
 /// Interned string descriptor.
+#[derive(Clone, Copy)]
 struct StringState {
     /// Ref count of the interned string.
     ref_count: u16,
@@ -446,7 +464,7 @@ struct StringInChunk {
 
 struct StringChunk {
     /// Size of `data` array in bytes.
-    chunk_size: u16,
+    chunk_size: ChunkSize,
 
     /// Num of bytes in `data` array containing string bytes.
     occupied_bytes: u16,
@@ -486,7 +504,7 @@ enum RemoveResult {
 }
 
 impl StringChunk {
-    fn new(chunk_size: u16) -> Self {
+    fn new(chunk_size: ChunkSize) -> Self {
         Self {
             chunk_size,
             occupied_bytes: 0,
@@ -667,27 +685,25 @@ mod tests {
 
     #[test]
     fn test() {
-        const CHUNK_SIZE: u16 = 8;
+        const CHUNK_SIZE: ChunkSize = 8;
 
         let mut pool = StringPool::new(CHUNK_SIZE);
 
+        // Empty strings.
         let empty = "";
-
-        let empty_id = pool.intern(empty);
-        assert_eq!(empty_id, StringID::default());
-        assert!(pool.lookup(empty_id).is_none());
+        assert_eq!(pool.intern(empty).unwrap_err(), StringPoolError::EmptyString);
 
         let asdf = "asdf";
         let gh = "gh";
 
-        let asdf_id = pool.intern(asdf);
+        let asdf_id = pool.intern(asdf).unwrap();
         assert_eq!(asdf_id.0, string_hash(asdf));
         assert_eq!(asdf_id, StringPool::string_id(asdf));
 
         assert_eq!(pool.lookup(asdf_id).unwrap(), asdf);
 
         // Should not allocate new data.
-        let asdf_id_2 = pool.intern(asdf);
+        let asdf_id_2 = pool.intern(asdf).unwrap();
         assert_eq!(asdf_id, asdf_id_2);
 
         assert_eq!(pool.lookup(asdf_id_2).unwrap(), asdf);
@@ -701,7 +717,7 @@ mod tests {
         assert_eq!(gh_id.0, string_hash(gh));
 
         unsafe {
-            pool.intern_with_id(gh, gh_id);
+            pool.intern_with_id(gh, gh_id).unwrap();
         }
 
         assert_eq!(pool.lookup(gh_id).unwrap(), gh);
@@ -735,7 +751,7 @@ mod tests {
         // Should allocate a new chunk.
         let long_string = "asdfghjk";
 
-        let long_string_id = pool.intern(long_string);
+        let long_string_id = pool.intern(long_string).unwrap();
 
         assert_eq!(pool.lookup(long_string_id).unwrap(), long_string);
 
@@ -748,5 +764,9 @@ mod tests {
 
         // Should free the last chunk.
         pool.remove(long_string_id);
+
+        // String too long.
+        let very_long_string = "asdfghjkl";
+        assert_eq!(pool.intern(very_long_string).unwrap_err(), StringPoolError::StringTooLong(8));
     }
 }
