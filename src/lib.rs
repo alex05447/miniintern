@@ -101,7 +101,7 @@ impl UnsafeStr {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum StringPoolError {
     /// Attempted to intern an empty (zero-length) string.
     EmptyString,
@@ -113,6 +113,22 @@ pub enum StringPoolError {
     /// String hash collision detected.
     /// Contains the pair of colliding strings and their hash.
     HashCollision((String, String, StringID)),
+}
+
+impl Display for StringPoolError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        use StringPoolError::*;
+
+        match self{
+            EmptyString => write!(f, "Attempted to intern an empty (zero-length) string."),
+            StringTooLong(chunk_size) => write!(f, "Attempted to intern a string whose length in bytes is greater than the chunk size ({}b).", chunk_size),
+            HashCollision((str_1, str_2, hash)) => write!(
+                f,
+                "String hash collision detected: \"{}\" and \"{}\" hash to [{}]",
+                str_1, str_2, hash.0
+            ),
+        }
+    }
 }
 
 impl StringPool {
@@ -131,6 +147,11 @@ impl StringPool {
             chunks: Vec::new(),
             gc: Vec::new(),
         }
+    }
+
+    /// Returns the number of unique interned strings in the pool.
+    pub fn len(&self) -> usize {
+        self.lookup.len()
     }
 
     /// Calculates the [`StringID`] of the `string`, guaranteed to be the same as one returned by
