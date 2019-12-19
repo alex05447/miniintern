@@ -278,12 +278,27 @@ impl StringPool {
         Ok(())
     }
 
-    /// Looks up a previously [`intern`]'ed string via its [`StringID`].
+    /// Internally increments the ref count of the string previously interned with [`string_id`].
     ///
-    /// Returns `None` if `string_id` does not correspond to a currently interned string.
+    /// [`string_id`]: struct.StringID.html
+    pub fn copy(&mut self, string_id: StringID) -> Result<(), ()> {
+        // String was interned.
+        if let Some(state) = self.lookup.get_mut(&string_id) {
+            state.ref_count += 1;
+
+            Ok(())
+
+        } else {
+            Err(())
+        }
+    }
+
+    /// Looks up a previously [`intern`]'ed string via its [`string_id`].
+    ///
+    /// Returns `None` if [`string_id`] does not correspond to a currently interned string.
     ///
     /// [`intern`]: #method.intern
-    /// [`StringID`]: struct.StringID.html
+    /// [`string_id`]: struct.StringID.html
     pub fn lookup(&self, string_id: StringID) -> Option<&str> {
         // The string was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(state) = self.lookup.get(&string_id) {
@@ -295,14 +310,14 @@ impl StringPool {
         }
     }
 
-    /// Looks up a previously [`intern`]'ed string via its [`StringID`].
+    /// Looks up a previously [`intern`]'ed string via its [`string_id`].
     ///
-    /// Returns `None` if `string_id` does not correspond to a currently interned string.
+    /// Returns `None` if [`string_id`] does not correspond to a currently interned string.
     ///
     /// For use in multithreaded scenarios, in conjunction with `Mutex` / `RwLock`.
     ///
     /// [`intern`]: #method.intern
-    /// [`StringID`]: struct.StringID.html
+    /// [`string_id`]: struct.StringID.html
     pub unsafe fn lookup_unsafe(&self, string_id: StringID) -> Option<UnsafeStr> {
         self.lookup(string_id)
             .map(|string| UnsafeStr::from_str(string))
@@ -318,7 +333,7 @@ impl StringPool {
     /// [`intern`]: #method.intern
     /// [`string_id`]: struct.StringID.html
     /// [`looked up`]: #method.lookup
-    pub fn remove(&mut self, string_id: StringID) {
+    pub fn remove(&mut self, string_id: StringID) -> Result<(), ()> {
         let mut remove = false;
 
         // String was interned.
@@ -336,11 +351,16 @@ impl StringPool {
                     &mut self.lookup,
                 );
             }
+
+        } else {
+            return Err(());
         }
 
         if remove {
             self.lookup.remove(&string_id);
         }
+
+        Ok(())
     }
 
     /// Internally decrements the ref count associated with the [`string_id`] of a previously [`intern`]'ed string.
@@ -357,12 +377,17 @@ impl StringPool {
     /// [`string_id`]: struct.StringID.html
     /// [`looked up`]: #method.lookup
     /// [`gc`]: #method.gc
-    pub fn remove_gc(&mut self, string_id: StringID) {
+    pub fn remove_gc(&mut self, string_id: StringID) -> Result<(), ()> {
         // String was interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
             state.ref_count -= 1;
 
             self.gc.push(string_id);
+
+            Ok(())
+
+        } else {
+            Err(())
         }
     }
 
@@ -730,7 +755,17 @@ mod tests {
         assert_eq!(pool.lookup(asdf_id_2).unwrap(), asdf);
 
         // This decrements the ref count.
-        pool.remove(asdf_id_2);
+        pool.remove(asdf_id_2).unwrap();
+
+        assert_eq!(pool.lookup(asdf_id).unwrap(), asdf);
+
+        // This increments the ref count.
+        pool.copy(asdf_id).unwrap();
+
+        assert_eq!(pool.lookup(asdf_id).unwrap(), asdf);
+
+        // This decrements the ref count.
+        pool.remove(asdf_id).unwrap();
 
         assert_eq!(pool.lookup(asdf_id).unwrap(), asdf);
 
@@ -752,7 +787,7 @@ mod tests {
         }
 
         // Should not trigger defragmentation.
-        pool.remove_gc(asdf_id);
+        pool.remove_gc(asdf_id).unwrap();
 
         // The string may not be looked up any more.
         assert!(pool.lookup(asdf_id).is_none());
@@ -777,14 +812,14 @@ mod tests {
         assert_eq!(pool.lookup(long_string_id).unwrap(), long_string);
 
         // Should free the first chunk.
-        pool.remove(gh_id);
+        pool.remove(gh_id).unwrap();
 
         assert!(pool.lookup(gh_id).is_none());
 
         assert_eq!(pool.lookup(long_string_id).unwrap(), long_string);
 
         // Should free the last chunk.
-        pool.remove(long_string_id);
+        pool.remove(long_string_id).unwrap();
 
         // String too long.
         let very_long_string = "asdfghjkl";
