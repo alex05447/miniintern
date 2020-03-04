@@ -244,7 +244,11 @@ impl StringPool {
     /// [`look it up`]: #method.lookup
     /// [`remove`]: #method.remove
     /// [`string pool`]: struct.StringPool.html
-    pub unsafe fn intern_with_id(&mut self, string: &str, string_id: StringID) -> Result<(), StringPoolError> {
+    pub unsafe fn intern_with_id(
+        &mut self,
+        string: &str,
+        string_id: StringID,
+    ) -> Result<(), StringPoolError> {
         let len = string.len();
 
         if len > self.chunk_size as usize {
@@ -258,11 +262,9 @@ impl StringPool {
         let _actual_string_id = StringPool::string_id(string);
 
         debug_assert_eq!(
-            _actual_string_id,
-            string_id,
+            _actual_string_id, string_id,
             "`StringID` mismatch: expected {}, found {}.",
-            _actual_string_id,
-            string_id
+            _actual_string_id, string_id
         );
 
         // String was already interned.
@@ -271,18 +273,17 @@ impl StringPool {
             let looked_up_string = StringPool::lookup_in_state(&self.chunks, *state).unwrap();
 
             if looked_up_string != string {
-                return Err(
-                    StringPoolError::HashCollision(
-                        (
-                            string.to_owned(),
-                            looked_up_string.to_owned(),
-                            string_id,
-                        )
-                    )
-                );
+                return Err(StringPoolError::HashCollision((
+                    string.to_owned(),
+                    looked_up_string.to_owned(),
+                    string_id,
+                )));
             }
 
-            state.ref_count = state.ref_count.checked_add(1).expect("String ref count overflow.");
+            state.ref_count = state
+                .ref_count
+                .checked_add(1)
+                .expect("String ref count overflow.");
 
         // Else the string has not been interned yet.
         } else {
@@ -290,8 +291,13 @@ impl StringPool {
             let last_used_chunk = self.last_used_chunk as usize;
 
             if last_used_chunk < self.chunks.len() {
-                if let InternResult::Interned(lookup_index) = self.chunks[last_used_chunk].intern(string) {
-                    self.lookup.insert(string_id, StringState::new(last_used_chunk as u16, lookup_index));
+                if let InternResult::Interned(lookup_index) =
+                    self.chunks[last_used_chunk].intern(string)
+                {
+                    self.lookup.insert(
+                        string_id,
+                        StringState::new(last_used_chunk as u16, lookup_index),
+                    );
                     return Ok(());
                 }
             }
@@ -304,7 +310,10 @@ impl StringPool {
                 }
 
                 if let InternResult::Interned(lookup_index) = chunk.intern(string) {
-                    self.lookup.insert(string_id, StringState::new(chunk_index as u16, lookup_index));
+                    self.lookup.insert(
+                        string_id,
+                        StringState::new(chunk_index as u16, lookup_index),
+                    );
 
                     // Update the last used chunk index.
                     self.last_used_chunk = chunk_index as u16;
@@ -320,7 +329,8 @@ impl StringPool {
             // Must succeed.
             match chunk.intern(string) {
                 InternResult::Interned(lookup_index) => {
-                    self.lookup.insert(string_id, StringState::new(chunk_index, lookup_index));
+                    self.lookup
+                        .insert(string_id, StringState::new(chunk_index, lookup_index));
 
                     // Update the last used chunk index.
                     self.last_used_chunk = chunk_index;
@@ -345,10 +355,12 @@ impl StringPool {
     pub fn copy(&mut self, string_id: StringID) -> Result<(), ()> {
         // String was interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
-            state.ref_count = state.ref_count.checked_add(1).expect("String ref count overflow.");
+            state.ref_count = state
+                .ref_count
+                .checked_add(1)
+                .expect("String ref count overflow.");
 
             Ok(())
-
         } else {
             Err(())
         }
@@ -420,7 +432,6 @@ impl StringPool {
 
                 self.lookup.remove(&string_id);
             }
-
         } else {
             return Err(());
         }
@@ -456,7 +467,6 @@ impl StringPool {
             } else {
                 Err(())
             }
-
         } else {
             Err(())
         }
@@ -502,7 +512,11 @@ impl StringPool {
         if state.ref_count == 0 {
             None
         } else {
-            Some(StringPool::lookup_in_chunk(chunks, state.chunk_index, state.lookup_index))
+            Some(StringPool::lookup_in_chunk(
+                chunks,
+                state.chunk_index,
+                state.lookup_index,
+            ))
         }
     }
 
@@ -526,16 +540,13 @@ impl StringPool {
 
             // Patch the chunk indices referring to the now moved last chunk, if necessary.
             if last_chunk_index as usize != chunk_index {
-                for state in lookup
-                    .iter_mut()
-                    .filter_map(|(_, v)| {
-                        if v.chunk_index == last_chunk_index {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    })
-                {
+                for state in lookup.iter_mut().filter_map(|(_, v)| {
+                    if v.chunk_index == last_chunk_index {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                }) {
                     state.chunk_index = chunk_index as u16;
                 }
             }
@@ -817,7 +828,10 @@ mod tests {
 
         // Empty strings.
         let empty = "";
-        assert_eq!(pool.intern(empty).unwrap_err(), StringPoolError::EmptyString);
+        assert_eq!(
+            pool.intern(empty).unwrap_err(),
+            StringPoolError::EmptyString
+        );
 
         let asdf = "asdf";
         let gh = "gh";
@@ -903,6 +917,9 @@ mod tests {
 
         // String is too long.
         let very_long_string = "asdfghjkl";
-        assert_eq!(pool.intern(very_long_string).unwrap_err(), StringPoolError::StringTooLong(8));
+        assert_eq!(
+            pool.intern(very_long_string).unwrap_err(),
+            StringPoolError::StringTooLong(8)
+        );
     }
 }
