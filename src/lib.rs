@@ -4,9 +4,6 @@
 //!
 //! Originally written for `miniecs` string support in component data.
 //!
-//! TODO:
-//! - hash collisions are detected via a panic in debug mode, but not release.
-//!
 //! <https://ourmachinery.com/post/data-structures-part-3-arrays-of-arrays/>
 //!
 //! Singlethreaded use - simple:
@@ -51,11 +48,14 @@
 //! [`StringPool`]: struct.StringPool.html
 //! [`lookup_unsafe`]: struct.StringPool.html#method.lookup_unsafe
 
+#![allow(clippy::len_without_is_empty)]
+
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 
 /// Unique interned string identifier.
+///
 /// Internally it's just a string hash (as provided by [`DefaultHasher`]) -
 /// so `StringID` equality does not guarantee string equality.
 ///
@@ -69,6 +69,10 @@ impl Display for StringID {
     }
 }
 
+/// NOTE - maximum chunk size is `std::u16::MAX`, which determines the
+/// maximum length in bytes of the string which can be interned by the string pool.
+///
+/// NOTE - when changing the underlying type, also change the `StringOffset` / `StringLength` types.
 pub type ChunkSize = u16;
 
 /// Manages the collection of unique interned strings.
@@ -77,6 +81,7 @@ pub struct StringPool {
     chunk_size: ChunkSize,
     lookup: HashMap<StringID, StringState>,
     chunks: Vec<StringChunk>,
+    last_used_chunk: u16,
     gc: Vec<StringID>,
 }
 
@@ -90,8 +95,12 @@ pub struct UnsafeStr((*const u8, usize));
 impl UnsafeStr {
     /// Returns the actual interned string.
     ///
+    /// # Safety
+    ///
     /// Unsafe because it's up to the user to ensure the string does not outlive the string pool
-    /// or is not invalidated.
+    /// or is not invalidated by a concurrent call to [`remove`].
+    ///
+    /// [`remove`]: struct.StringPool.html#method.remove
     pub unsafe fn to_str(&self) -> &'static str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts((self.0).0, (self.0).1))
     }
@@ -101,17 +110,21 @@ impl UnsafeStr {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StringPoolError {
-    /// Attempted to intern an empty (zero-length) string.
+    /// Attempted to [`intern`] an empty (zero-length) string.
+    /// [`intern`]: struct.StringPool.html#method.intern
     EmptyString,
-    /// Attempted to intern a string whose length in bytes is greater
-    /// then the maximum length supported by the string pool
+    /// Attempted to [`intern`] a string whose length in bytes is greater
+    /// then the maximum length supported by the [`string pool`]
     /// (as determinded by the `chunk_size` parameter).
-    /// Contains the max string length in bytes supported by the [`StringPool`](struct.StringPool.html).
+    /// Contains the max string length in bytes supported by the [`string pool`]
+    /// [`string pool`]: struct.StringPool.html
+    /// [`intern`]: struct.StringPool.html#method.intern
     StringTooLong(ChunkSize),
-    /// String hash collision detected.
+    /// String hash collision detected in the call to [`intern`].
     /// Contains the pair of colliding strings and their hash.
+    /// [`intern`]: struct.StringPool.html#method.intern
     HashCollision((String, String, StringID)),
 }
 
@@ -132,7 +145,7 @@ impl Display for StringPoolError {
 }
 
 impl StringPool {
-    /// Creates a new string pool.
+    /// Creates a new [`string pool`].
     ///
     /// Interned strings are stored in chunks.
     ///
@@ -140,21 +153,27 @@ impl StringPool {
     /// Larger chunks allow for longer strings to be stored, but may have higher memory fragmentation
     /// if the strings are frequently added and removed, as the pool makes no effort to reuse
     /// free space in chunks until it exceeds 50% of the chunks size.
+    ///
+    /// [`string pool`]: struct.StringPool.html
     pub fn new(chunk_size: ChunkSize) -> Self {
         Self {
             chunk_size,
             lookup: HashMap::new(),
             chunks: Vec::new(),
+            last_used_chunk: 0,
             gc: Vec::new(),
         }
     }
 
-    /// Returns the number of unique interned strings in the pool.
+    /// Returns the number of unique interned strings in the [`string pool`].
+    ///
+    /// [`string pool`]: struct.StringPool.html
     pub fn len(&self) -> usize {
         self.lookup.len()
     }
 
-    /// Calculates the [`StringID`] of the `string`, guaranteed to be the same as one returned by
+    /// Calculates the [`StringID`] of the `string`.
+    /// Guaranteed to be the same as one returned by
     /// [`intern`] would the string be interned via it.
     ///
     /// NOTE - the function returns a default (null) [`StringID`] for empty (zero-length) strings.
@@ -162,19 +181,27 @@ impl StringPool {
     /// [`StringID`]: struct.StringID.html
     /// [`intern`]: #method.intern
     pub fn string_id(string: &str) -> StringID {
-        if string.len() == 0 {
+        if string.is_empty() {
             StringID::default()
         } else {
             StringID(string_hash(string))
         }
     }
 
-    /// Interns the string, returning the [`StringID`] which may be used to look it up or remove it from the pool.
+    /// Interns the `string`, returning the [`StringID`]
+    /// which may later be used to [`look it up`] or [`remove`] it from the [`string pool`].
     ///
-    /// If `string` was laready interned, returns the same [`StringID`] as the one returned by the previous call to `intern`,
+    /// If `string` was already interned, returns the same [`StringID`] as the one returned by the previous call to `intern`,
     /// internally incrementing the string's ref count.
     ///
+    /// # Panics
+    ///
+    /// Panics if the string's ref count overflows (currently, a `u16` is used to store it).
+    ///
     /// [`StringID`]: struct.StringID.html
+    /// [`look it up`]: #method.lookup
+    /// [`remove`]: #method.remove
+    /// [`string pool`]: struct.StringPool.html
     pub fn intern(&mut self, string: &str) -> Result<StringID, StringPoolError> {
         let len = string.len();
 
@@ -195,9 +222,10 @@ impl StringPool {
         Ok(string_id)
     }
 
-    /// Interns the string using the `string_id`, previously returned for `string` by the call to [`string_id`],
-    /// which may be used to look it up or remove it from the pool.
-    /// If `string` was laready interned, internally increments the string's ref count.
+    /// Interns the `string` using the `string_id`, previously returned for `string` by the call to [`string_id`],
+    /// which may later be used to [`look it up`] or [`remove`] it from the [`string pool`].
+    ///
+    /// If `string` was already interned, internally increments the string's ref count.
     ///
     /// NOTE - meant for use as an optimization in cases where it's possible and beneficial to split [`StringID`] calculation (hashing)
     /// and interning.
@@ -209,11 +237,21 @@ impl StringPool {
     /// # Panics
     ///
     /// In debug mode only, panics if `string_id` does not correspond to `string`.
+    /// Panics if the string's ref count overflows (currently, a `u16` is used to store it).
     ///
     /// [`string_id`]: #method.string_id
     /// [`StringID`]: struct.StringID.html
+    /// [`look it up`]: #method.lookup
+    /// [`remove`]: #method.remove
+    /// [`string pool`]: struct.StringPool.html
     pub unsafe fn intern_with_id(&mut self, string: &str, string_id: StringID) -> Result<(), StringPoolError> {
-        if string.len() == 0 {
+        let len = string.len();
+
+        if len > self.chunk_size as usize {
+            return Err(StringPoolError::StringTooLong(self.chunk_size));
+        }
+
+        if len == 0 {
             return Err(StringPoolError::EmptyString);
         }
 
@@ -222,7 +260,7 @@ impl StringPool {
         debug_assert_eq!(
             _actual_string_id,
             string_id,
-            "String / StringID mismatch: expected {}, found {}.",
+            "`StringID` mismatch: expected {}, found {}.",
             _actual_string_id,
             string_id
         );
@@ -230,7 +268,7 @@ impl StringPool {
         // String was already interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
             // Check for hash collision.
-            let looked_up_string = StringPool::lookup_in_state(&self.chunks, state).unwrap();
+            let looked_up_string = StringPool::lookup_in_state(&self.chunks, *state).unwrap();
 
             if looked_up_string != string {
                 return Err(
@@ -244,50 +282,70 @@ impl StringPool {
                 );
             }
 
-            state.ref_count += 1;
+            state.ref_count = state.ref_count.checked_add(1).expect("String ref count overflow.");
 
         // Else the string has not been interned yet.
         } else {
-            // Try to intern in all chunks in order.
-            let mut interned = false;
+            // Try to intern in the last used chunk.
+            let last_used_chunk = self.last_used_chunk as usize;
 
+            if last_used_chunk < self.chunks.len() {
+                if let InternResult::Interned(lookup_index) = self.chunks[last_used_chunk].intern(string) {
+                    self.lookup.insert(string_id, StringState::new(last_used_chunk as u16, lookup_index));
+                    return Ok(());
+                }
+            }
+
+            // If the above failed, try to intern in all chunks in order.
             for (chunk_index, chunk) in self.chunks.iter_mut().enumerate() {
+                // Already checked above.
+                if chunk_index == last_used_chunk {
+                    continue;
+                }
+
                 if let InternResult::Interned(lookup_index) = chunk.intern(string) {
-                    let state = StringState::new(chunk_index as u16, lookup_index);
-                    self.lookup.insert(string_id, state);
-                    interned = true;
-                    break;
+                    self.lookup.insert(string_id, StringState::new(chunk_index as u16, lookup_index));
+
+                    // Update the last used chunk index.
+                    self.last_used_chunk = chunk_index as u16;
+
+                    return Ok(());
                 }
             }
 
             // No chunks / no space in all chunks - allocate a new one.
-            if !interned {
-                let mut chunk = StringChunk::new(self.chunk_size);
-                let chunk_index = self.chunks.len();
+            let mut chunk = StringChunk::new(self.chunk_size);
+            let chunk_index = self.chunks.len() as u16;
 
-                // Must succeed.
-                match chunk.intern(string) {
-                    InternResult::Interned(lookup_index) => {
-                        let state = StringState::new(chunk_index as u16, lookup_index);
-                        self.lookup.insert(string_id, state);
-                    }
-                    _ => unreachable!(),
-                };
+            // Must succeed.
+            match chunk.intern(string) {
+                InternResult::Interned(lookup_index) => {
+                    self.lookup.insert(string_id, StringState::new(chunk_index, lookup_index));
 
-                self.chunks.push(chunk);
-            }
+                    // Update the last used chunk index.
+                    self.last_used_chunk = chunk_index;
+                }
+                _ => unreachable!(),
+            };
+
+            self.chunks.push(chunk);
         }
 
         Ok(())
     }
 
-    /// Internally increments the ref count of the string previously interned with [`string_id`].
+    /// Internally increments the ref count of the string, previously [`intern`]'ed with [`string_id`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the string's ref count overflows (currently, a `u16` is used to store it).
+    ///
+    /// [`intern`]: #method.intern
     /// [`string_id`]: struct.StringID.html
     pub fn copy(&mut self, string_id: StringID) -> Result<(), ()> {
         // String was interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
-            state.ref_count += 1;
+            state.ref_count = state.ref_count.checked_add(1).expect("String ref count overflow.");
 
             Ok(())
 
@@ -305,7 +363,7 @@ impl StringPool {
     pub fn lookup(&self, string_id: StringID) -> Option<&str> {
         // The string was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(state) = self.lookup.get(&string_id) {
-            StringPool::lookup_in_state(&self.chunks, state)
+            StringPool::lookup_in_state(&self.chunks, *state)
 
         // String was not interned, or was already removed.
         } else {
@@ -319,8 +377,17 @@ impl StringPool {
     ///
     /// For use in multithreaded scenarios, in conjunction with `Mutex` / `RwLock`.
     ///
+    /// # Safety
+    ///
+    /// Unsafe because the returned string points to the internal memory of the string pool,
+    /// which may get overwritten by a concurrent call to [`remove`] - it's up to the
+    /// user to ensure [`remove_gc`] / [`gc`] are used instead.
+    ///
     /// [`intern`]: #method.intern
     /// [`string_id`]: struct.StringID.html
+    /// [`remove`]: struct.StringPool.html#method.remove
+    /// [`remove_gc`]: #method.remove_gc
+    /// [`gc`]: #method.gc
     pub unsafe fn lookup_unsafe(&self, string_id: StringID) -> Option<UnsafeStr> {
         self.lookup(string_id)
             .map(|string| UnsafeStr::from_str(string))
@@ -331,36 +398,31 @@ impl StringPool {
     /// When the ref count reaches zero, the string is removed from the pool - it may no longer be [`looked up`].
     /// May invalidate the previously [`looked up`] strings.
     ///
-    /// Does nothing if [`string_id`] does not correspond to a currently interned string.
+    /// Does nothing if [`string_id`] does not correspond to a currently [`intern`]'ed string.
     ///
     /// [`intern`]: #method.intern
     /// [`string_id`]: struct.StringID.html
-    /// [`looked up`]: #method.lookup
+    /// [`looked up`]: #method.lookup_unsafe
     pub fn remove(&mut self, string_id: StringID) -> Result<(), ()> {
-        let mut remove = false;
-
         // String was interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
+            debug_assert!(state.ref_count > 0);
             state.ref_count -= 1;
 
             // This was the last use of this string - remove it from the chunk.
             if state.ref_count == 0 {
-                remove = true;
-
                 StringPool::remove_from_chunk(
                     state.chunk_index,
                     state.lookup_index,
                     &mut self.chunks,
                     &mut self.lookup,
                 );
+
+                self.lookup.remove(&string_id);
             }
 
         } else {
             return Err(());
-        }
-
-        if remove {
-            self.lookup.remove(&string_id);
         }
 
         Ok(())
@@ -428,11 +490,14 @@ impl StringPool {
         }
     }
 
+    // NOTE - the caller guarantees `chunk_index` and `lookup_index` are valid.
     fn lookup_in_chunk(chunks: &[StringChunk], chunk_index: u16, lookup_index: u16) -> &str {
-        chunks[chunk_index as usize].lookup(lookup_index)
+        let chunk_index = chunk_index as usize;
+        debug_assert!(chunk_index < chunks.len());
+        chunks[chunk_index].lookup(lookup_index)
     }
 
-    fn lookup_in_state<'a>(chunks: &'a[StringChunk], state: &StringState) -> Option<&'a str> {
+    fn lookup_in_state(chunks: &[StringChunk], state: StringState) -> Option<&str> {
         // If the ref count is `0`, the string was removed but not yet garbage collected.
         if state.ref_count == 0 {
             None
@@ -441,39 +506,39 @@ impl StringPool {
         }
     }
 
+    // NOTE - the caller guarantees `chunk_index` and `lookup_index` are valid.
     fn remove_from_chunk(
         chunk_index: ChunkIndex,
         lookup_index: LookupIndex,
         chunks: &mut Vec<StringChunk>,
         lookup: &mut HashMap<StringID, StringState>,
     ) {
-        match chunks[chunk_index as usize].remove(lookup_index) {
+        let chunk_index = chunk_index as usize;
+        debug_assert!(chunk_index < chunks.len());
+
+        if let RemoveResult::ChunkFree = chunks[chunk_index].remove(lookup_index) {
             // The chunk is completely empty - we just free it immediately.
-            RemoveResult::ChunkFree => {
-                let last_chunk_index = (chunks.len() - 1) as u16;
+            let last_chunk_index = (chunks.len() - 1) as u16;
 
-                let free_chunk = chunks.swap_remove(chunk_index as usize);
-                std::mem::drop(free_chunk);
+            // Remove the chunk by swapping it with the last one.
+            let free_chunk = chunks.swap_remove(chunk_index);
+            std::mem::drop(free_chunk);
 
-                // Patch the chunk indices if necessary.
-                if last_chunk_index != chunk_index {
-                    for state in lookup
-                        .iter_mut()
-                        .filter_map(|(_, v)| {
-                            if v.chunk_index == last_chunk_index {
-                                Some(v)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<&mut StringState>>()
-                    {
-                        state.chunk_index = chunk_index;
-                    }
+            // Patch the chunk indices referring to the now moved last chunk, if necessary.
+            if last_chunk_index as usize != chunk_index {
+                for state in lookup
+                    .iter_mut()
+                    .filter_map(|(_, v)| {
+                        if v.chunk_index == last_chunk_index {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    state.chunk_index = chunk_index as u16;
                 }
             }
-
-            _ => {}
         }
     }
 }
@@ -486,10 +551,8 @@ type LookupIndex = u16;
 struct StringState {
     /// Ref count of the interned string.
     ref_count: u16,
-
     /// Index of the chunk in which the string is interned.
     chunk_index: ChunkIndex,
-
     /// Index of the element in the chunk's offset lookup array
     /// which contains this string's offset from the chunk's start and its length.
     lookup_index: LookupIndex,
@@ -505,33 +568,34 @@ impl StringState {
     }
 }
 
+/// NOTE - make sure the underlying type matches the `ChunkSize` type above.
 type StringOffset = u16;
 type StringLength = u16;
 
+/// Describes the interned string slice's location in the string chunk.
 #[derive(Clone, Copy)]
 struct StringInChunk {
-    // String start offset from `data` array start.
+    /// String start offset in bytes from `data` array start.
     offset: StringOffset,
-
-    // String length in bytes.
+    /// String length in bytes.
     length: StringLength,
 }
 
+/// A fixed-size memory chunk used to store interned strings.
 struct StringChunk {
     /// Size of `data` array in bytes.
     chunk_size: ChunkSize,
-
     /// Num of bytes in `data` array containing string bytes.
-    occupied_bytes: u16,
-
+    occupied_bytes: ChunkSize,
     /// First free byte in the `data` array.
     first_free_byte: StringOffset,
-
+    /// Starts `false`.
+    /// Set to `true` when interning, whenever occupancy reaches >50%.
+    /// Set to `false` when removing, whenever occupancy reaches <50% and the chunk is defragmented.
     fragmented: bool,
-
     /// Lookup array for string offsets/lengths.
-    offset_lookup: Vec<StringInChunk>,
-
+    lookup: Vec<StringInChunk>,
+    /// The chunk's string data array.
     data: *mut u8,
 }
 
@@ -542,18 +606,16 @@ impl Drop for StringChunk {
 }
 
 enum InternResult {
-    /// Not enought free space left in the chunk.
+    /// Not enough free space left in the chunk.
     NoSpace,
-
     /// Successfully interned the string.
-    /// Contains the lookup index.
+    /// Contains the index of the string in the chunk's lookup array.
     Interned(LookupIndex),
 }
 
 enum RemoveResult {
     /// Chunk still has some strings in it.
     ChunkInUse,
-
     /// Chunk is completely empty and may be freed.
     ChunkFree,
 }
@@ -564,9 +626,8 @@ impl StringChunk {
             chunk_size,
             occupied_bytes: 0,
             first_free_byte: 0,
-            fragmented: true,
-            offset_lookup: Vec::new(),
-
+            fragmented: false,
+            lookup: Vec::new(),
             // Invalid UTF-8 byte sequence.
             data: malloc(chunk_size as usize, b'\xc0'),
         }
@@ -585,19 +646,19 @@ impl StringChunk {
 
         let offset = self.first_free_byte;
 
-        let lookup_index = self.offset_lookup.len() as LookupIndex;
-        self.offset_lookup.push(StringInChunk { offset, length });
+        let lookup_index = self.lookup.len() as LookupIndex;
+        self.lookup.push(StringInChunk { offset, length });
 
         self.first_free_byte += length;
 
-        // If we were defragmented and are now >50% occupancy -
-        // mark the chunk as fragmented again.
-        if !self.fragmented && ((self.occupied_bytes + length) > (self.chunk_size / 2)) {
-            self.fragmented = true;
-        }
-
         self.occupied_bytes += length;
         debug_assert!(self.occupied_bytes <= self.chunk_size);
+
+        // If we were defragmented and are now >50% occupancy -
+        // mark the chunk as fragmented.
+        if !self.fragmented && (self.occupied_bytes > (self.chunk_size / 2)) {
+            self.fragmented = true;
+        }
 
         let src = string.as_bytes().as_ptr();
         let dst = unsafe { self.data.offset(offset as isize) };
@@ -609,24 +670,28 @@ impl StringChunk {
         InternResult::Interned(lookup_index)
     }
 
+    // NOTE - the caller guarantees `lookup_index` is valid.
     fn lookup(&self, lookup_index: LookupIndex) -> &str {
-        let string_in_chunk = &self.offset_lookup[lookup_index as usize];
+        let lookup_index = lookup_index as usize;
+        debug_assert!(lookup_index < self.lookup.len());
+        let string_in_chunk = &self.lookup[lookup_index];
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
 
-        let slice = unsafe {
+        unsafe {
             let src = self.data.offset(string_in_chunk.offset as isize);
-            std::slice::from_raw_parts(src, string_in_chunk.length as usize)
-        };
-
-        std::str::from_utf8(slice).unwrap()
+            let slice = std::slice::from_raw_parts(src, string_in_chunk.length as usize);
+            std::str::from_utf8_unchecked(slice)
+        }
     }
 
+    // NOTE - the caller guarantees `lookup_index` is valid.
     fn remove(&mut self, lookup_index: LookupIndex) -> RemoveResult {
-        let string_in_chunk = &mut self.offset_lookup[lookup_index as usize];
+        let lookup_index = lookup_index as usize;
+        debug_assert!(lookup_index < self.lookup.len());
+        let string_in_chunk = &mut self.lookup[lookup_index];
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
-        debug_assert!(self.occupied_bytes >= string_in_chunk.length);
 
         unsafe {
             let dst = self.data.offset(string_in_chunk.offset as isize);
@@ -635,21 +700,25 @@ impl StringChunk {
             std::ptr::write_bytes(dst, b'\xc0', string_in_chunk.length as usize);
         }
 
+        debug_assert!(self.occupied_bytes >= string_in_chunk.length);
         self.occupied_bytes -= string_in_chunk.length;
-
-        string_in_chunk.offset = std::u16::MAX;
-        string_in_chunk.length = std::u16::MAX;
 
         if self.occupied_bytes == 0 {
             return RemoveResult::ChunkFree;
         }
 
+        // Mark this lookup entry as free and keep it as a tombstone.
+        // Garbage collection / defragmentation will take care of it later.
+        string_in_chunk.offset = std::u16::MAX;
+        string_in_chunk.length = std::u16::MAX;
+
         // Defragment if <50% occupied and not already defragmented.
         if self.fragmented && (self.occupied_bytes < self.chunk_size / 2) {
             // Gather string ranges.
+            // Tuples of (current string offset/length, new string offset).
             let mut current_strings = Vec::new();
 
-            for string_in_chunk in self.offset_lookup.iter() {
+            for string_in_chunk in self.lookup.iter() {
                 if string_in_chunk.offset == std::u16::MAX {
                     debug_assert!(string_in_chunk.length == std::u16::MAX);
                     continue;
@@ -657,6 +726,8 @@ impl StringChunk {
 
                 current_strings.push((*string_in_chunk, 0));
             }
+
+            // Sanity check - string lengths must add up to chunk's occupied bytes.
             debug_assert_eq!(
                 current_strings
                     .iter()
@@ -702,7 +773,7 @@ impl StringChunk {
             // Patch the offsets.
             for (string_in_chunk, new_offset) in current_strings.iter() {
                 let found = self
-                    .offset_lookup
+                    .lookup
                     .iter_mut()
                     .find(|el| el.offset == string_in_chunk.offset)
                     .unwrap();
@@ -830,7 +901,7 @@ mod tests {
         // Should free the last chunk.
         pool.remove(long_string_id).unwrap();
 
-        // String too long.
+        // String is too long.
         let very_long_string = "asdfghjkl";
         assert_eq!(pool.intern(very_long_string).unwrap_err(), StringPoolError::StringTooLong(8));
     }
