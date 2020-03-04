@@ -249,30 +249,33 @@ impl StringPool {
         // Else the string has not been interned yet.
         } else {
             // Try to intern in all chunks in order.
+            let mut interned = false;
+
             for (chunk_index, chunk) in self.chunks.iter_mut().enumerate() {
-                match chunk.intern(string) {
-                    InternResult::Interned(lookup_index) => {
-                        let new_state = StringState::new(chunk_index as u16, lookup_index);
-                        self.lookup.insert(string_id, new_state);
-                    }
-                    _ => {}
+                if let InternResult::Interned(lookup_index) = chunk.intern(string) {
+                    let state = StringState::new(chunk_index as u16, lookup_index);
+                    self.lookup.insert(string_id, state);
+                    interned = true;
+                    break;
                 }
             }
 
             // No chunks / no space in all chunks - allocate a new one.
-            let mut chunk = StringChunk::new(self.chunk_size);
-            let chunk_index = self.chunks.len();
+            if !interned {
+                let mut chunk = StringChunk::new(self.chunk_size);
+                let chunk_index = self.chunks.len();
 
-            // Must succeed.
-            match chunk.intern(string) {
-                InternResult::Interned(lookup_index) => {
-                    let new_state = StringState::new(chunk_index as u16, lookup_index);
-                    self.lookup.insert(string_id, new_state);
-                }
-                _ => unreachable!(),
-            };
+                // Must succeed.
+                match chunk.intern(string) {
+                    InternResult::Interned(lookup_index) => {
+                        let state = StringState::new(chunk_index as u16, lookup_index);
+                        self.lookup.insert(string_id, state);
+                    }
+                    _ => unreachable!(),
+                };
 
-            self.chunks.push(chunk);
+                self.chunks.push(chunk);
+            }
         }
 
         Ok(())
