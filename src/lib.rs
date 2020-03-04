@@ -383,11 +383,17 @@ impl StringPool {
     pub fn remove_gc(&mut self, string_id: StringID) -> Result<(), ()> {
         // String was interned.
         if let Some(state) = self.lookup.get_mut(&string_id) {
-            state.ref_count -= 1;
+            if state.ref_count > 0 {
+                state.ref_count -= 1;
+                self.gc.push(string_id);
 
-            self.gc.push(string_id);
+                Ok(())
 
-            Ok(())
+            // Looks like we called this method more times than `intern` / `copy`,
+            // and `lookup` has not been updated yet by a call to `gc`.
+            } else {
+                Err(())
+            }
 
         } else {
             Err(())
