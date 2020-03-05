@@ -587,6 +587,7 @@ type StringLength = u16;
 #[derive(Clone, Copy)]
 struct StringInChunk {
     /// String start offset in bytes from `data` array start.
+    /// Also used as the lookup array entry free list node.
     offset: StringOffset,
     /// String length in bytes.
     length: StringLength,
@@ -606,6 +607,9 @@ struct StringChunk {
     fragmented: bool,
     /// Lookup array for string offsets/lengths.
     lookup: Vec<StringInChunk>,
+    /// First free index in the lookup array, or `std::u16::MAX`.
+    /// Free lookup array entries form a linked list via their `offset` field.
+    first_free_index: u16,
     /// The chunk's string data array.
     data: *mut u8,
 }
@@ -639,6 +643,7 @@ impl StringChunk {
             first_free_byte: 0,
             fragmented: false,
             lookup: Vec::new(),
+            first_free_index: std::u16::MAX,
             // Invalid UTF-8 byte sequence.
             data: malloc(chunk_size as usize, b'\xc0'),
         }
@@ -657,8 +662,20 @@ impl StringChunk {
 
         let offset = self.first_free_byte;
 
-        let lookup_index = self.lookup.len() as LookupIndex;
-        self.lookup.push(StringInChunk { offset, length });
+        // Get the lookup index from the free list, or allocate a new element.
+        let lookup_index = if self.first_free_index != std::u16::MAX {
+            let lookup_index = self.first_free_index;
+            debug_assert!((lookup_index as usize) < self.lookup.len());
+            let string_in_chunk = &mut self.lookup[lookup_index as usize];
+            self.first_free_index = string_in_chunk.offset;
+            string_in_chunk.offset = offset;
+            string_in_chunk.length = length;
+            lookup_index
+        } else {
+            let lookup_index = self.lookup.len() as LookupIndex;
+            self.lookup.push(StringInChunk { offset, length });
+            lookup_index
+        };
 
         self.first_free_byte += length;
 
@@ -698,9 +715,8 @@ impl StringChunk {
 
     // NOTE - the caller guarantees `lookup_index` is valid.
     fn remove(&mut self, lookup_index: LookupIndex) -> RemoveResult {
-        let lookup_index = lookup_index as usize;
-        debug_assert!(lookup_index < self.lookup.len());
-        let string_in_chunk = &mut self.lookup[lookup_index];
+        debug_assert!((lookup_index as usize) < self.lookup.len());
+        let string_in_chunk = &mut self.lookup[lookup_index as usize];
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
 
@@ -718,10 +734,10 @@ impl StringChunk {
             return RemoveResult::ChunkFree;
         }
 
-        // Mark this lookup entry as free and keep it as a tombstone.
-        // Garbage collection / defragmentation will take care of it later.
-        string_in_chunk.offset = std::u16::MAX;
+        // Put this lookup entry on the free list.
+        string_in_chunk.offset = self.first_free_index;
         string_in_chunk.length = std::u16::MAX;
+        self.first_free_index = lookup_index;
 
         // Defragment if <50% occupied and not already defragmented.
         if self.fragmented && (self.occupied_bytes < self.chunk_size / 2) {
@@ -730,8 +746,8 @@ impl StringChunk {
             let mut current_strings = Vec::new();
 
             for string_in_chunk in self.lookup.iter() {
-                if string_in_chunk.offset == std::u16::MAX {
-                    debug_assert!(string_in_chunk.length == std::u16::MAX);
+                // Skip the free entries.
+                if string_in_chunk.length == std::u16::MAX {
                     continue;
                 }
 
@@ -895,8 +911,10 @@ mod tests {
         pool.gc();
 
         assert!(pool.lookup(asdf_id).is_none());
-
         assert_eq!(pool.lookup(gh_id).unwrap(), gh);
+
+        let asdf_id = pool.intern(asdf).unwrap();
+        assert_eq!(pool.lookup(asdf_id).unwrap(), asdf);
 
         // Should allocate a new chunk.
         let long_string = "asdfghjk";
