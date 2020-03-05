@@ -291,8 +291,10 @@ impl StringPool {
             let last_used_chunk = self.last_used_chunk as usize;
 
             if last_used_chunk < self.chunks.len() {
-                if let InternResult::Interned(lookup_index) =
-                    self.chunks.get_unchecked_mut(last_used_chunk).intern(string)
+                if let InternResult::Interned(lookup_index) = self
+                    .chunks
+                    .get_unchecked_mut(last_used_chunk)
+                    .intern(string)
                 {
                     self.lookup.insert(
                         string_id,
@@ -530,7 +532,9 @@ impl StringPool {
         let chunk_index = chunk_index as usize;
         debug_assert!(chunk_index < chunks.len());
 
-        if let RemoveResult::ChunkFree = unsafe { chunks.get_unchecked_mut(chunk_index) }.remove(lookup_index) {
+        if let RemoveResult::ChunkFree =
+            unsafe { chunks.get_unchecked_mut(chunk_index) }.remove(lookup_index)
+        {
             // The chunk is completely empty - we just free it immediately.
             let last_chunk_index = (chunks.len() - 1) as u16;
 
@@ -668,7 +672,7 @@ impl StringChunk {
         let lookup_index = if self.first_free_index != std::u16::MAX {
             let lookup_index = self.first_free_index as usize;
             debug_assert!(lookup_index < self.lookup.len());
-            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index)};
+            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index) };
             self.first_free_index = string_in_chunk.offset;
             string_in_chunk.offset = offset;
             string_in_chunk.length = length;
