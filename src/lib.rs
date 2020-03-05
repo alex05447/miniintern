@@ -292,7 +292,7 @@ impl StringPool {
 
             if last_used_chunk < self.chunks.len() {
                 if let InternResult::Interned(lookup_index) =
-                    self.chunks[last_used_chunk].intern(string)
+                    self.chunks.get_unchecked_mut(last_used_chunk).intern(string)
                 {
                     self.lookup.insert(
                         string_id,
@@ -504,7 +504,7 @@ impl StringPool {
     fn lookup_in_chunk(chunks: &[StringChunk], chunk_index: u16, lookup_index: u16) -> &str {
         let chunk_index = chunk_index as usize;
         debug_assert!(chunk_index < chunks.len());
-        chunks[chunk_index].lookup(lookup_index)
+        unsafe { chunks.get_unchecked(chunk_index) }.lookup(lookup_index)
     }
 
     fn lookup_in_state(chunks: &[StringChunk], state: StringState) -> Option<&str> {
@@ -530,7 +530,7 @@ impl StringPool {
         let chunk_index = chunk_index as usize;
         debug_assert!(chunk_index < chunks.len());
 
-        if let RemoveResult::ChunkFree = chunks[chunk_index].remove(lookup_index) {
+        if let RemoveResult::ChunkFree = unsafe { chunks.get_unchecked_mut(chunk_index) }.remove(lookup_index) {
             // The chunk is completely empty - we just free it immediately.
             let last_chunk_index = (chunks.len() - 1) as u16;
 
@@ -556,6 +556,7 @@ impl StringPool {
 
 type ChunkIndex = u16;
 type LookupIndex = u16;
+const INVALID_INDEX: u16 = std::u16::MAX;
 
 /// Interned string descriptor.
 #[derive(Clone, Copy)]
@@ -582,6 +583,7 @@ impl StringState {
 /// NOTE - make sure the underlying type matches the `ChunkSize` type above.
 type StringOffset = u16;
 type StringLength = u16;
+const INVALID_LENGTH: u16 = std::u16::MAX;
 
 /// Describes the interned string slice's location in the string chunk.
 #[derive(Clone, Copy)]
@@ -609,7 +611,7 @@ struct StringChunk {
     lookup: Vec<StringInChunk>,
     /// First free index in the lookup array, or `std::u16::MAX`.
     /// Free lookup array entries form a linked list via their `offset` field.
-    first_free_index: u16,
+    first_free_index: StringOffset,
     /// The chunk's string data array.
     data: *mut u8,
 }
@@ -643,7 +645,7 @@ impl StringChunk {
             first_free_byte: 0,
             fragmented: false,
             lookup: Vec::new(),
-            first_free_index: std::u16::MAX,
+            first_free_index: INVALID_INDEX,
             // Invalid UTF-8 byte sequence.
             data: malloc(chunk_size as usize, b'\xc0'),
         }
@@ -664,13 +666,13 @@ impl StringChunk {
 
         // Get the lookup index from the free list, or allocate a new element.
         let lookup_index = if self.first_free_index != std::u16::MAX {
-            let lookup_index = self.first_free_index;
-            debug_assert!((lookup_index as usize) < self.lookup.len());
-            let string_in_chunk = &mut self.lookup[lookup_index as usize];
+            let lookup_index = self.first_free_index as usize;
+            debug_assert!(lookup_index < self.lookup.len());
+            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index)};
             self.first_free_index = string_in_chunk.offset;
             string_in_chunk.offset = offset;
             string_in_chunk.length = length;
-            lookup_index
+            lookup_index as LookupIndex
         } else {
             let lookup_index = self.lookup.len() as LookupIndex;
             self.lookup.push(StringInChunk { offset, length });
@@ -702,7 +704,7 @@ impl StringChunk {
     fn lookup(&self, lookup_index: LookupIndex) -> &str {
         let lookup_index = lookup_index as usize;
         debug_assert!(lookup_index < self.lookup.len());
-        let string_in_chunk = &self.lookup[lookup_index];
+        let string_in_chunk = unsafe { self.lookup.get_unchecked(lookup_index) };
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
 
@@ -716,7 +718,7 @@ impl StringChunk {
     // NOTE - the caller guarantees `lookup_index` is valid.
     fn remove(&mut self, lookup_index: LookupIndex) -> RemoveResult {
         debug_assert!((lookup_index as usize) < self.lookup.len());
-        let string_in_chunk = &mut self.lookup[lookup_index as usize];
+        let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index as usize) };
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
 
@@ -736,7 +738,7 @@ impl StringChunk {
 
         // Put this lookup entry on the free list.
         string_in_chunk.offset = self.first_free_index;
-        string_in_chunk.length = std::u16::MAX;
+        string_in_chunk.length = INVALID_LENGTH;
         self.first_free_index = lookup_index;
 
         // Defragment if <50% occupied and not already defragmented.
@@ -747,7 +749,7 @@ impl StringChunk {
 
             for string_in_chunk in self.lookup.iter() {
                 // Skip the free entries.
-                if string_in_chunk.length == std::u16::MAX {
+                if string_in_chunk.length == INVALID_LENGTH {
                     continue;
                 }
 
