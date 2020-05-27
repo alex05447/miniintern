@@ -106,6 +106,7 @@ const INVALID_LENGTH: u16 = 0;
 type RefCount = u16;
 
 /// Invalid UTF-8 byte sequence, used to fill the unused space in the string chunks.
+#[cfg(debug)]
 const CHUNK_FILL_VALUE: u8 = b'\xc0';
 
 /// Manages the collection of unique interned strings.
@@ -691,7 +692,10 @@ impl StringChunk {
             fragmented: false,
             lookup: Vec::new(),
             first_free_index: INVALID_INDEX,
+            #[cfg(debug)]
             data: malloc(chunk_size as usize, CHUNK_FILL_VALUE),
+            #[cfg(not(debug))]
+            data: malloc(chunk_size as usize, 0),
         }
     }
 
@@ -758,7 +762,14 @@ impl StringChunk {
         unsafe {
             let src = self.data.offset(string_in_chunk.offset as isize);
             let slice = std::slice::from_raw_parts(src, string_in_chunk.length as usize);
-            std::str::from_utf8_unchecked(slice)
+            #[cfg(debug)]
+            {
+                std::str::from_utf8_unchecked(slice)
+            }
+            #[cfg(not(debug))]
+            {
+                std::str::from_utf8(slice).unwrap()
+            }
         }
     }
 
@@ -770,10 +781,10 @@ impl StringChunk {
         debug_assert!(string_in_chunk.offset < self.chunk_size);
         debug_assert!(string_in_chunk.length <= self.chunk_size);
 
+        // Fill the now empty space with garbage.
+        #[cfg(debug)]
         unsafe {
             let dst = self.data.offset(string_in_chunk.offset as isize);
-
-            // Fill the now empty space with garbage.
             std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, string_in_chunk.length as usize);
         }
 
@@ -836,13 +847,16 @@ impl StringChunk {
             self.first_free_byte = self.occupied_bytes;
 
             // Fill the now free space with garbage.
-            let remaining_bytes = self.chunk_size - self.first_free_byte;
+            #[cfg(debug)]
+            {
+                let remaining_bytes = self.chunk_size - self.first_free_byte;
 
-            if remaining_bytes > 0 {
-                unsafe {
-                    let dst = self.data.offset(self.first_free_byte as isize);
+                if remaining_bytes > 0 {
+                    unsafe {
+                        let dst = self.data.offset(self.first_free_byte as isize);
 
-                    std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, remaining_bytes as usize);
+                        std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, remaining_bytes as usize);
+                    }
                 }
             }
 
