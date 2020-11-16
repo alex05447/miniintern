@@ -188,7 +188,7 @@ impl StringPool {
                     // Look up the string in the chunk to check for hash collisions.
                     let looked_up_string = {
                         let string_chunk = unsafe { string_state.string_chunk.as_mut() };
-                        string_chunk.lookup(string_state.lookup_index)
+                        string_chunk.lookup(string_state.lookup_index, Self::data_size(self.chunk_size))
                     };
 
                     // The strings are the same - increment the ref count and return the existing `StringID`.
@@ -232,7 +232,7 @@ impl StringPool {
                         // Look up the string in the chunk.
                         let looked_up_string = {
                             let string_chunk = unsafe { string_state.string_chunk.as_mut() };
-                            string_chunk.lookup(string_state.lookup_index)
+                            string_chunk.lookup(string_state.lookup_index, Self::data_size(self.chunk_size))
                         };
 
                         // The strings are the same - increment the ref count and return the existing `StringID`.
@@ -365,7 +365,7 @@ impl StringPool {
                     } else {
                         let string_chunk = unsafe { &*state.string_chunk.as_ptr() };
 
-                        Ok(string_chunk.lookup(state.lookup_index))
+                        Ok(string_chunk.lookup(state.lookup_index, Self::data_size(self.chunk_size)))
                     }
 
                 // Else, mismatched generations - the `string_id` is for a hash-colliding string,
@@ -442,6 +442,7 @@ impl StringPool {
             &mut self.string_chunks,
             &mut self.num_strings,
             false,
+            self.chunk_size
         )
     }
 
@@ -553,6 +554,7 @@ impl StringPool {
                 &mut self.string_chunks,
                 &mut self.num_strings,
                 true,
+                self.chunk_size
             );
         }
     }
@@ -569,7 +571,7 @@ impl StringPool {
         if let Some(mut last_used_chunk) = last_used_chunk {
             // Successfully interned in the last used chunk.
             if let InternResult::Interned(lookup_index) =
-                unsafe { last_used_chunk.as_mut() }.intern(string)
+                unsafe { last_used_chunk.as_mut() }.intern(string, Self::data_size(chunk_size))
             {
                 let state = StringState {
                     ref_count: 1,
@@ -599,7 +601,7 @@ impl StringPool {
 
             // Successfully interned in the current chunk.
             if let InternResult::Interned(lookup_index) =
-                unsafe { string_chunk.as_mut() }.intern(string)
+                unsafe { string_chunk.as_mut() }.intern(string, Self::data_size(chunk_size))
             {
                 // Update the `last_used_chunk`.
                 *last_used_chunk = Some(*string_chunk);
@@ -629,7 +631,7 @@ impl StringPool {
         string_chunks.push(new_chunk);
 
         // Must succeed - the chunk is guaranteed to have enough space.
-        if let InternResult::Interned(lookup_index) = unsafe { new_chunk.as_mut() }.intern(string) {
+        if let InternResult::Interned(lookup_index) = unsafe { new_chunk.as_mut() }.intern(string, Self::data_size(chunk_size)) {
             // Update the `last_used_chunk`.
             *last_used_chunk = Some(new_chunk);
 
@@ -659,6 +661,7 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         gc: bool,
+        chunk_size: ChunkSize,
     ) -> Result<(), Error> {
         // The string with this hash was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(hash_state) = lookup.get_mut(&string_id.string_hash) {
@@ -677,6 +680,7 @@ impl StringPool {
                                     string_chunks,
                                     num_strings,
                                     gc,
+                                    chunk_size,
                                 );
 
                                 lookup.remove(&string_id.string_hash);
@@ -701,6 +705,7 @@ impl StringPool {
                                     string_chunks,
                                     num_strings,
                                     gc,
+                                    chunk_size
                                 );
 
                                 lookup.remove(&string_id.string_hash);
@@ -746,6 +751,7 @@ impl StringPool {
                                     string_chunks,
                                     num_strings,
                                     gc,
+                                    chunk_size
                                 );
 
                                 // Remove the string from the state array.
@@ -786,12 +792,13 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         gc: bool,
+        chunk_size: ChunkSize
     ) {
         let string_chunk = unsafe { string_chunk_ptr.as_mut() };
 
         // This was the last string in the chunk and it's now empty - free it.
-        if let RemoveResult::ChunkFree = string_chunk.remove(lookup_index) {
-            StringChunk::free(string_chunk_ptr);
+        if let RemoveResult::ChunkFree = string_chunk.remove(lookup_index, Self::data_size(chunk_size)) {
+            StringChunk::free(string_chunk_ptr, Self::data_size(chunk_size));
             string_chunks.retain(|chunk| *chunk != string_chunk_ptr);
         }
 
@@ -800,12 +807,17 @@ impl StringPool {
             *num_strings -= 1;
         }
     }
+
+    fn data_size(chunk_size: ChunkSize) -> ChunkSize {
+        debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
+        chunk_size - STRING_CHUNK_HEADER_SIZE
+    }
 }
 
 impl Drop for StringPool {
     fn drop(&mut self) {
         while let Some(chunk) = self.string_chunks.pop() {
-            StringChunk::free(chunk);
+            StringChunk::free(chunk, Self::data_size(self.chunk_size));
         }
     }
 }
