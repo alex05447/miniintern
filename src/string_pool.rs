@@ -3,7 +3,7 @@ use {
         error::Error,
         hash::{fnv1a32, StringHash},
         string_chunk::{
-            ChunkSize, InternResult, LookupIndex, RemoveResult, StringChunk,
+            ChunkSizeInternal, ChunkSize, InternResult, LookupIndex, RemoveResult, StringChunk,
             STRING_CHUNK_HEADER_SIZE,
         },
         string_id::{StringGeneration, StringID},
@@ -48,7 +48,7 @@ impl StringState {
         unsafe { self.string_chunk.as_ref() }
     }
 
-    fn lookup(&self, data_size: ChunkSize) -> &str {
+    fn lookup(&self, data_size: ChunkSizeInternal) -> &str {
         self.string_chunk().lookup(self.lookup_index, data_size)
     }
 }
@@ -87,7 +87,7 @@ impl UnsafeStr {
 pub struct StringPool {
     /// Size in bytes of string chunks, allocated by the string pool to store the strings.
     /// Determines (minus the string hunk header overhead) the max supported interned string length in bytes.
-    chunk_size: ChunkSize,
+    chunk_size: ChunkSizeInternal,
     /// Maps the string hash to the string state - ref count, generation and chunk / index in chunk.
     lookup: HashMap<StringHash, HashState>,
     /// Total number of unique strings interned in the pool
@@ -119,10 +119,8 @@ impl StringPool {
     /// free space in chunks until it exceeds 50% of the chunk's size.
     ///
     /// [`string pool`]: struct.StringPool.html
-    pub fn new(mut chunk_size: ChunkSize) -> Result<Self, Error> {
-        if chunk_size == 0 {
-            return Err(Error::InvalidChunkSize);
-        }
+    pub fn new(chunk_size: ChunkSize) -> Result<Self, Error> {
+        let mut chunk_size = chunk_size.get();
 
         // Must at least have enough space for the header.
         if chunk_size < STRING_CHUNK_HEADER_SIZE {
@@ -182,7 +180,7 @@ impl StringPool {
         if string_length > data_size as usize {
             return Err(Error::StringTooLong {
                 string_length,
-                max_string_length: data_size,
+                max_string_length: unsafe { ChunkSize::new_unchecked(data_size) },
             });
         }
 
@@ -569,7 +567,7 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         generation: &mut StringGeneration,
-        chunk_size: ChunkSize,
+        chunk_size: ChunkSizeInternal,
     ) -> StringState {
         // Try to intern in the last used chunk.
         if let Some(mut last_used_chunk) = last_used_chunk {
@@ -665,7 +663,7 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         gc: bool,
-        chunk_size: ChunkSize,
+        chunk_size: ChunkSizeInternal,
     ) -> Result<(), Error> {
         // The string with this hash was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(hash_state) = lookup.get_mut(&string_id.string_hash) {
@@ -796,7 +794,7 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         gc: bool,
-        chunk_size: ChunkSize
+        chunk_size: ChunkSizeInternal
     ) {
         let string_chunk = unsafe { string_chunk_ptr.as_mut() };
 
@@ -812,7 +810,7 @@ impl StringPool {
         }
     }
 
-    fn data_size(chunk_size: ChunkSize) -> ChunkSize {
+    fn data_size(chunk_size: ChunkSizeInternal) -> ChunkSizeInternal {
         debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
         chunk_size - STRING_CHUNK_HEADER_SIZE
     }
@@ -832,14 +830,7 @@ mod tests {
 
     use super::*;
 
-    const CHUNK_SIZE: ChunkSize = 8;
-
-    #[test]
-    fn InvalidChunkSize() {
-        assert!(matches!(StringPool::new(0), Err(Error::InvalidChunkSize)));
-
-        StringPool::new(CHUNK_SIZE).unwrap();
-    }
+    const CHUNK_SIZE: ChunkSize = unsafe { ChunkSize::new_unchecked(8) };
 
     #[test]
     fn EmptyString() {

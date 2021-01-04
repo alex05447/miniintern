@@ -8,9 +8,6 @@ use {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error {
-    /// Provided an invalid value for a chunk size when creating the [`string pool`].
-    /// [`string pool`]: struct.StringPool.html
-    InvalidChunkSize,
     /// Attempted to [`intern`] an empty (zero-length) string.
     /// [`intern`]: struct.StringPool.html#method.intern
     EmptyString,
@@ -41,7 +38,6 @@ impl Display for Error {
         use Error::*;
 
         match self{
-            InvalidChunkSize => "provided an invalid value for a chunk size when creating the string pool".fmt(f),
             EmptyString => "attempted to intern an empty (zero-length) string".fmt(f),
             StringTooLong { string_length, max_string_length} => write!(
                 f, "attempted to intern a string whose length in bytes ({}b) exceeds the maximum supported value ({}b)",

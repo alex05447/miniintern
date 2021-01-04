@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use std::{ptr::NonNull, num::NonZeroU16 };
 
 /// Type for the size in bytes of the string chunks the [`string pool`] allocates internally for string storage.
 ///
@@ -8,7 +8,9 @@ use std::ptr::NonNull;
 /// NOTE - when changing the underlying type, also change the `StringOffset` / `StringLength` / `LookupIndex` types.
 ///
 /// [`string pool`]: struct.StringPool.html
-pub type ChunkSize = u16;
+pub type ChunkSize = NonZeroU16;
+
+pub(crate) type ChunkSizeInternal = u16;
 
 /// Type for the index of the string in the string chunk's `lookup` array.
 ///
@@ -36,7 +38,7 @@ const INVALID_LENGTH: u16 = 0;
 //#[cfg(debug)]
 const CHUNK_FILL_VALUE: u8 = b'\xc0';
 
-pub(crate) const STRING_CHUNK_HEADER_SIZE: u16 = std::mem::size_of::<StringChunk>() as u16;
+pub(crate) const STRING_CHUNK_HEADER_SIZE: ChunkSizeInternal = std::mem::size_of::<StringChunk>() as _;
 
 pub(crate) enum InternResult {
     /// Not enough free space left in the chunk.
@@ -69,7 +71,7 @@ pub(crate) struct StringChunk {
     /// The string pool knows its size and passes it down when necessary.
     data: *mut u8,
     /// Num of bytes in `data` array containing string bytes.
-    occupied_bytes: ChunkSize,
+    occupied_bytes: ChunkSizeInternal,
     /// First free byte in the `data` array.
     first_free_byte: StringOffset,
     /// Starts `false`.
@@ -89,7 +91,7 @@ pub(crate) struct StringChunk {
 
 impl StringChunk {
     /// Allocates a new `StringChunk` on the heap.
-    pub(crate) fn allocate(chunk_size: ChunkSize) -> NonNull<Self> {
+    pub(crate) fn allocate(chunk_size: ChunkSizeInternal) -> NonNull<Self> {
         // Ensured by the caller.
         debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
 
@@ -113,7 +115,7 @@ impl StringChunk {
     }
 
     /// Cleans up and frees the `StringChunk`.
-    pub(crate) fn free(ptr: NonNull<StringChunk>, chunk_size: ChunkSize) {
+    pub(crate) fn free(ptr: NonNull<StringChunk>, chunk_size: ChunkSizeInternal) {
         let chunk = unsafe { std::ptr::read_unaligned(ptr.as_ptr()) };
         std::mem::drop(chunk);
 
@@ -124,7 +126,7 @@ impl StringChunk {
     }
 
     /// Tries to intern the string in this chunk.
-    pub(crate) fn intern(&mut self, string: &str, data_size: ChunkSize) -> InternResult {
+    pub(crate) fn intern(&mut self, string: &str, data_size: ChunkSizeInternal) -> InternResult {
         let length = string.len();
         // NOTE - guaranteed to fit by the calling code.
         debug_assert!(length <= data_size as usize);
@@ -179,7 +181,7 @@ impl StringChunk {
 
     /// Looks up the string in this chunk given its `lookup_index`.
     /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
-    pub(crate) fn lookup(&self, lookup_index: LookupIndex, data_size: ChunkSize) -> &str {
+    pub(crate) fn lookup(&self, lookup_index: LookupIndex, data_size: ChunkSizeInternal) -> &str {
         let lookup_index = lookup_index as usize;
         debug_assert!(lookup_index < self.lookup.len());
         let string_in_chunk = unsafe { self.lookup.get_unchecked(lookup_index) };
@@ -199,7 +201,7 @@ impl StringChunk {
 
     /// Removes the string from this chunk given its `lookup_index`.
     /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
-    pub(crate) fn remove(&mut self, lookup_index: LookupIndex, data_size: ChunkSize) -> RemoveResult {
+    pub(crate) fn remove(&mut self, lookup_index: LookupIndex, data_size: ChunkSizeInternal) -> RemoveResult {
         debug_assert!((lookup_index as usize) < self.lookup.len());
         let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index as usize) };
         debug_assert!(string_in_chunk.offset < data_size);
@@ -245,12 +247,12 @@ impl StringChunk {
         }
     }
 
-    fn needs_to_defragment(&self, data_size: ChunkSize) -> bool {
+    fn needs_to_defragment(&self, data_size: ChunkSizeInternal) -> bool {
         self.fragmented && (self.occupied_bytes < data_size / 2)
     }
 
     #[cold]
-    fn defragment(&mut self, data_size: ChunkSize) {
+    fn defragment(&mut self, data_size: ChunkSizeInternal) {
         debug_assert!(self.fragmented);
 
         // Gather the string ranges.
@@ -345,9 +347,9 @@ mod tests {
 
     #[test]
     fn string_chunk() {
-        const SMALL_CHUNK_DATA_SIZE: ChunkSize = 8;
+        const SMALL_CHUNK_DATA_SIZE: ChunkSizeInternal = 8;
         assert!(SMALL_CHUNK_DATA_SIZE < STRING_CHUNK_HEADER_SIZE);
-        const SMALL_CHUNK_SIZE: ChunkSize = SMALL_CHUNK_DATA_SIZE + STRING_CHUNK_HEADER_SIZE;
+        const SMALL_CHUNK_SIZE: ChunkSizeInternal = SMALL_CHUNK_DATA_SIZE + STRING_CHUNK_HEADER_SIZE;
 
         let mut chunk = StringChunk::allocate(SMALL_CHUNK_SIZE);
 
@@ -489,10 +491,10 @@ mod tests {
 
         StringChunk::free(chunk, SMALL_CHUNK_SIZE);
 
-        const LARGE_CHUNK_SIZE: ChunkSize = 256;
+        const LARGE_CHUNK_SIZE: ChunkSizeInternal = 256;
         assert!(LARGE_CHUNK_SIZE > STRING_CHUNK_HEADER_SIZE);
 
-        const LARGE_CHUNK_DATA_SIZE: ChunkSize = LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;
+        const LARGE_CHUNK_DATA_SIZE: ChunkSizeInternal = LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;
 
         let mut chunk = StringChunk::allocate(LARGE_CHUNK_SIZE);
 
