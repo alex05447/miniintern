@@ -43,6 +43,16 @@ struct StringState {
     lookup_index: LookupIndex,
 }
 
+impl StringState {
+    fn string_chunk(&self) -> &StringChunk {
+        unsafe { self.string_chunk.as_ref() }
+    }
+
+    fn lookup(&self, data_size: ChunkSize) -> &str {
+        self.string_chunk().lookup(self.lookup_index, data_size)
+    }
+}
+
 /// A string slice in the [`string pool`] represented as a raw pointer + length.
 /// Returned by [`lookup_unsafe`].
 /// Used as an escape hatch for `MutexGuard<StringPool>` / `RwLockGuard<StringPool>` string lifetime.
@@ -186,10 +196,7 @@ impl StringPool {
                 // There's a single string with this hash.
                 HashState::Single(string_state) => {
                     // Look up the string in the chunk to check for hash collisions.
-                    let looked_up_string = {
-                        let string_chunk = unsafe { string_state.string_chunk.as_mut() };
-                        string_chunk.lookup(string_state.lookup_index, Self::data_size(self.chunk_size))
-                    };
+                    let looked_up_string = string_state.lookup(Self::data_size(self.chunk_size));
 
                     // The strings are the same - increment the ref count and return the existing `StringID`.
                     if string == looked_up_string {
@@ -230,10 +237,7 @@ impl StringPool {
                 HashState::Multiple(states) => {
                     for string_state in states.iter_mut() {
                         // Look up the string in the chunk.
-                        let looked_up_string = {
-                            let string_chunk = unsafe { string_state.string_chunk.as_mut() };
-                            string_chunk.lookup(string_state.lookup_index, Self::data_size(self.chunk_size))
-                        };
+                        let looked_up_string = string_state.lookup(Self::data_size(self.chunk_size));
 
                         // The strings are the same - increment the ref count and return the existing `StringID`.
                         if string == looked_up_string {
