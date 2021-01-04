@@ -345,12 +345,11 @@ mod tests {
 
     #[test]
     fn string_chunk() {
-        const SMALL_CHUNK_SIZE: ChunkSize = 8;
-        assert!(SMALL_CHUNK_SIZE < STRING_CHUNK_HEADER_SIZE);
+        const SMALL_CHUNK_DATA_SIZE: ChunkSize = 8;
+        assert!(SMALL_CHUNK_DATA_SIZE < STRING_CHUNK_HEADER_SIZE);
+        const SMALL_CHUNK_SIZE: ChunkSize = SMALL_CHUNK_DATA_SIZE + STRING_CHUNK_HEADER_SIZE;
 
-        const DATA_SIZE: ChunkSize = SMALL_CHUNK_SIZE;
-
-        let mut chunk = StringChunk::allocate(SMALL_CHUNK_SIZE + STRING_CHUNK_HEADER_SIZE);
+        let mut chunk = StringChunk::allocate(SMALL_CHUNK_SIZE);
 
         let chunk_ref = unsafe { chunk.as_mut() };
 
@@ -360,7 +359,7 @@ mod tests {
         assert!(chunk_ref.lookup.is_empty());
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        let foo_idx = if let InternResult::Interned(idx) = chunk_ref.intern("foo", DATA_SIZE) {
+        let foo_idx = if let InternResult::Interned(idx) = chunk_ref.intern("foo", SMALL_CHUNK_DATA_SIZE) {
             idx
         } else {
             panic!("failed to intern");
@@ -380,9 +379,9 @@ mod tests {
         );
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        assert_eq!(chunk_ref.lookup(foo_idx, DATA_SIZE), "foo");
+        assert_eq!(chunk_ref.lookup(foo_idx, SMALL_CHUNK_DATA_SIZE), "foo");
 
-        let bar_idx = if let InternResult::Interned(idx) = chunk_ref.intern("bar", DATA_SIZE) {
+        let bar_idx = if let InternResult::Interned(idx) = chunk_ref.intern("bar", SMALL_CHUNK_DATA_SIZE) {
             idx
         } else {
             panic!("failed to intern");
@@ -408,12 +407,12 @@ mod tests {
         );
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        assert_eq!(chunk_ref.lookup(bar_idx, DATA_SIZE), "bar");
+        assert_eq!(chunk_ref.lookup(bar_idx, SMALL_CHUNK_DATA_SIZE), "bar");
 
-        assert!(matches!(chunk_ref.intern("baz", DATA_SIZE), InternResult::NoSpace));
+        assert!(matches!(chunk_ref.intern("baz", SMALL_CHUNK_DATA_SIZE), InternResult::NoSpace));
 
         assert!(matches!(
-            chunk_ref.remove(foo_idx, DATA_SIZE),
+            chunk_ref.remove(foo_idx, SMALL_CHUNK_DATA_SIZE),
             RemoveResult::ChunkInUse
         ));
 
@@ -435,7 +434,7 @@ mod tests {
         ); // <- has 1 hole
         assert_eq!(chunk_ref.first_free_index, 0);
 
-        let baz_idx = if let InternResult::Interned(idx) = chunk_ref.intern("baz", DATA_SIZE) {
+        let baz_idx = if let InternResult::Interned(idx) = chunk_ref.intern("baz", SMALL_CHUNK_DATA_SIZE) {
             idx
         } else {
             panic!("failed to intern");
@@ -461,10 +460,10 @@ mod tests {
         );
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        assert_eq!(chunk_ref.lookup(baz_idx, DATA_SIZE), "baz");
+        assert_eq!(chunk_ref.lookup(baz_idx, SMALL_CHUNK_DATA_SIZE), "baz");
 
         assert!(matches!(
-            chunk_ref.remove(bar_idx, DATA_SIZE),
+            chunk_ref.remove(bar_idx, SMALL_CHUNK_DATA_SIZE),
             RemoveResult::ChunkInUse
         ));
 
@@ -486,14 +485,14 @@ mod tests {
         ); // <- has 1 hole
         assert_eq!(chunk_ref.first_free_index, 1);
 
-        assert!(matches!(chunk_ref.remove(baz_idx, DATA_SIZE), RemoveResult::ChunkFree));
+        assert!(matches!(chunk_ref.remove(baz_idx, SMALL_CHUNK_DATA_SIZE), RemoveResult::ChunkFree));
 
         StringChunk::free(chunk, SMALL_CHUNK_SIZE);
 
         const LARGE_CHUNK_SIZE: ChunkSize = 256;
         assert!(LARGE_CHUNK_SIZE > STRING_CHUNK_HEADER_SIZE);
 
-        const LARGE_DATA_SIZE: ChunkSize = LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;
+        const LARGE_CHUNK_DATA_SIZE: ChunkSize = LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;
 
         let mut chunk = StringChunk::allocate(LARGE_CHUNK_SIZE);
 
@@ -505,7 +504,7 @@ mod tests {
         assert!(chunk_ref.lookup.is_empty());
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        let large_string_idx = if let InternResult::Interned(idx) = chunk_ref.intern("asdfghjkl", LARGE_DATA_SIZE) {
+        let large_string_idx = if let InternResult::Interned(idx) = chunk_ref.intern("asdfghjkl", LARGE_CHUNK_DATA_SIZE) {
             idx
         } else {
             panic!("failed to intern");
@@ -525,10 +524,10 @@ mod tests {
         );
         assert_eq!(chunk_ref.first_free_index, INVALID_INDEX);
 
-        assert_eq!(chunk_ref.lookup(foo_idx, LARGE_DATA_SIZE), "asdfghjkl");
+        assert_eq!(chunk_ref.lookup(foo_idx, LARGE_CHUNK_DATA_SIZE), "asdfghjkl");
 
         assert!(matches!(
-            chunk_ref.remove(large_string_idx, LARGE_DATA_SIZE),
+            chunk_ref.remove(large_string_idx, LARGE_CHUNK_DATA_SIZE),
             RemoveResult::ChunkFree
         ));
 
