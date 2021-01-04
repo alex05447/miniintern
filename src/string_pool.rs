@@ -798,7 +798,7 @@ impl StringPool {
 
         // This was the last string in the chunk and it's now empty - free it.
         if let RemoveResult::ChunkFree = string_chunk.remove(lookup_index, Self::data_size(chunk_size)) {
-            StringChunk::free(string_chunk_ptr, Self::data_size(chunk_size));
+            StringChunk::free(string_chunk_ptr, chunk_size);
             string_chunks.retain(|chunk| *chunk != string_chunk_ptr);
         }
 
@@ -817,7 +817,7 @@ impl StringPool {
 impl Drop for StringPool {
     fn drop(&mut self) {
         while let Some(chunk) = self.string_chunks.pop() {
-            StringChunk::free(chunk, Self::data_size(self.chunk_size));
+            StringChunk::free(chunk, self.chunk_size);
         }
     }
 }
