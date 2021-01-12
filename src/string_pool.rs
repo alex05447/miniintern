@@ -1,9 +1,9 @@
 use {
     super::{
         error::Error,
-        hash::{fnv1a32, StringHash},
+        hash::{string_hash_fnv1a, StringHash},
         string_chunk::{
-            ChunkSizeInternal, ChunkSize, InternResult, LookupIndex, RemoveResult, StringChunk,
+            ChunkSize, ChunkSizeInternal, InternResult, LookupIndex, RemoveResult, StringChunk,
             STRING_CHUNK_HEADER_SIZE,
         },
         string_id::{StringGeneration, StringID},
@@ -28,13 +28,9 @@ enum HashState {
     Multiple(Vec<StringState>),
 }
 
-/// Interned string descriptor.
-#[derive(Clone, Copy)]
-struct StringState {
-    /// Ref count of the interned string.
-    ref_count: RefCount,
-    /// Generation of the interned string.
-    generation: StringGeneration,
+/// Storage info for an interned string stored in a chunk.
+#[derive(Clone)]
+struct ChunkString {
     /// Pointer to the string chunk the string is interned in.
     /// Strings never move between chunks.
     string_chunk: NonNull<StringChunk>,
@@ -43,13 +39,63 @@ struct StringState {
     lookup_index: LookupIndex,
 }
 
-impl StringState {
+impl ChunkString {
     fn string_chunk(&self) -> &StringChunk {
         unsafe { self.string_chunk.as_ref() }
     }
+}
+
+/// Type of interned string storage.
+#[derive(Clone)]
+enum StringStorage {
+    /// Most strings are stored in chunks.
+    Chunk(ChunkString),
+    /// Strings longer than chunk size are stored individually on the heap.
+    String(String),
+}
+
+/// Interned string info.
+#[derive(Clone)]
+struct StringState {
+    /// Ref count of the interned string.
+    ref_count: RefCount,
+    /// Generation of the interned string.
+    generation: StringGeneration,
+    /// The string's storage info - in the chunk or on the heap.
+    storage: StringStorage,
+}
+
+impl StringState {
+    fn new_chunk(
+        generation: StringGeneration,
+        string_chunk: NonNull<StringChunk>,
+        lookup_index: LookupIndex,
+    ) -> Self {
+        Self {
+            ref_count: 1,
+            generation,
+            storage: StringStorage::Chunk(ChunkString {
+                string_chunk,
+                lookup_index,
+            }),
+        }
+    }
+
+    fn new_string(generation: StringGeneration, string: String) -> Self {
+        Self {
+            ref_count: 1,
+            generation,
+            storage: StringStorage::String(string),
+        }
+    }
 
     fn lookup(&self, data_size: ChunkSizeInternal) -> &str {
-        self.string_chunk().lookup(self.lookup_index, data_size)
+        match &self.storage {
+            StringStorage::Chunk(chunk) => {
+                chunk.string_chunk().lookup(chunk.lookup_index, data_size)
+            }
+            StringStorage::String(string) => string.as_str(),
+        }
     }
 }
 
@@ -81,8 +127,8 @@ impl UnsafeStr {
 }
 
 /// Manages the collection of unique interned strings.
-/// Attempts to store the strings contiguosly in (configurable) fixed-size memory chunks,
-/// allocated on demand.
+/// Attempts to store the strings contiguosly in (configurable) fixed-size memory chunks, allocated on demand.
+///
 /// Uses ref-counting internally to deduplicate stored strings.
 pub struct StringPool {
     /// Size in bytes of string chunks, allocated by the string pool to store the strings.
@@ -113,10 +159,11 @@ impl StringPool {
     /// (unless `chunk_size` is smaller than the (small) string chunk header overhead,
     /// in which case slightly more memory will be allocated per chunk).
     ///
-    /// `chunk_size` determines the max supported interned string length in bytes.
+    /// `chunk_size` determines the max string length in bytes which may be interned in a chunk.
     /// Larger chunks allow for longer strings to be stored, but may have higher memory fragmentation
     /// if the strings are frequently added and removed, as the pool makes no effort to reuse
     /// free space in chunks until it exceeds 50% of the chunk's size.
+    /// Strings longer than chunk size are allocated on the heap individually.
     ///
     /// [`string pool`]: struct.StringPool.html
     pub fn new(chunk_size: ChunkSize) -> Result<Self, Error> {
@@ -174,18 +221,8 @@ impl StringPool {
             return Err(Error::EmptyString);
         }
 
-        debug_assert!(self.chunk_size > STRING_CHUNK_HEADER_SIZE);
-        let data_size = self.chunk_size - STRING_CHUNK_HEADER_SIZE;
-
-        if string_length > data_size as usize {
-            return Err(Error::StringTooLong {
-                string_length,
-                max_string_length: unsafe { ChunkSize::new_unchecked(data_size) },
-            });
-        }
-
         // Hash the string.
-        let string_hash = fnv1a32(string);
+        let string_hash = string_hash_fnv1a(string);
 
         // The string(s) with this hash was (were) interned
         // (but might have been `remove_gc`'d and not yet `gc`'d).
@@ -215,6 +252,7 @@ impl StringPool {
                     } else {
                         let new_state = Self::intern_new_string(
                             string,
+                            string_length,
                             &mut self.last_used_chunk,
                             &mut self.string_chunks,
                             &mut self.num_strings,
@@ -222,12 +260,25 @@ impl StringPool {
                             self.chunk_size,
                         );
 
+                        let generation = new_state.generation;
+
                         // Change the hash's state from single to multiple.
-                        *hash_state = HashState::Multiple(vec![*string_state, new_state]);
+                        if let Some(hash_state) = self.lookup.remove(&string_hash) {
+                            if let HashState::Single(string_state) = hash_state {
+                                self.lookup.insert(
+                                    string_hash,
+                                    HashState::Multiple(vec![string_state, new_state]),
+                                );
+                            } else {
+                                debug_assert!(false, "unreachable");
+                            }
+                        } else {
+                            debug_assert!(false, "unreachable");
+                        }
 
                         return Ok(StringID {
                             string_hash,
-                            generation: new_state.generation,
+                            generation,
                         });
                     }
                 }
@@ -235,7 +286,8 @@ impl StringPool {
                 HashState::Multiple(states) => {
                     for string_state in states.iter_mut() {
                         // Look up the string in the chunk.
-                        let looked_up_string = string_state.lookup(Self::data_size(self.chunk_size));
+                        let looked_up_string =
+                            string_state.lookup(Self::data_size(self.chunk_size));
 
                         // The strings are the same - increment the ref count and return the existing `StringID`.
                         if string == looked_up_string {
@@ -257,6 +309,7 @@ impl StringPool {
                     // Must intern with a new `StringID`.
                     let new_state = Self::intern_new_string(
                         string,
+                        string_length,
                         &mut self.last_used_chunk,
                         &mut self.string_chunks,
                         &mut self.num_strings,
@@ -264,11 +317,13 @@ impl StringPool {
                         self.chunk_size,
                     );
 
+                    let generation = new_state.generation;
+
                     states.push(new_state);
 
                     return Ok(StringID {
                         string_hash,
-                        generation: new_state.generation,
+                        generation,
                     });
                 }
             }
@@ -277,6 +332,7 @@ impl StringPool {
         } else {
             let new_state = Self::intern_new_string(
                 string,
+                string_length,
                 &mut self.last_used_chunk,
                 &mut self.string_chunks,
                 &mut self.num_strings,
@@ -284,12 +340,16 @@ impl StringPool {
                 self.chunk_size,
             );
 
-            self.lookup
+            let generation = new_state.generation;
+
+            let _none = self
+                .lookup
                 .insert(string_hash, HashState::Single(new_state));
+            debug_assert!(_none.is_none());
 
             return Ok(StringID {
                 string_hash,
-                generation: new_state.generation,
+                generation,
             });
         }
     }
@@ -365,9 +425,10 @@ impl StringPool {
                     if state.ref_count == 0 {
                         Err(Error::InvalidStringID)
                     } else {
-                        let string_chunk = unsafe { &*state.string_chunk.as_ptr() };
-
-                        Ok(string_chunk.lookup(state.lookup_index, Self::data_size(self.chunk_size)))
+                        // TODO - review the safety of this.
+                        Ok(unsafe {
+                            std::mem::transmute(state.lookup(Self::data_size(self.chunk_size)))
+                        })
                     }
 
                 // Else, mismatched generations - the `string_id` is for a hash-colliding string,
@@ -444,7 +505,7 @@ impl StringPool {
             &mut self.string_chunks,
             &mut self.num_strings,
             false,
-            self.chunk_size
+            self.chunk_size,
         )
     }
 
@@ -556,31 +617,42 @@ impl StringPool {
                 &mut self.string_chunks,
                 &mut self.num_strings,
                 true,
-                self.chunk_size
+                self.chunk_size,
             );
         }
     }
 
     fn intern_new_string(
         string: &str,
+        length: usize,
         last_used_chunk: &mut Option<NonNull<StringChunk>>,
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         generation: &mut StringGeneration,
         chunk_size: ChunkSizeInternal,
     ) -> StringState {
+        debug_assert_eq!(string.len(), length);
+
+        if length > Self::data_size(chunk_size) as usize {
+            let state = StringState::new_string(*generation, string.to_owned());
+
+            // Increment the generation counter for a new unique string.
+            *generation = generation
+                .checked_add(1)
+                .expect("generation counter overflow");
+
+            *num_strings += 1;
+
+            return state;
+        }
+
         // Try to intern in the last used chunk.
         if let Some(mut last_used_chunk) = last_used_chunk {
             // Successfully interned in the last used chunk.
             if let InternResult::Interned(lookup_index) =
                 unsafe { last_used_chunk.as_mut() }.intern(string, Self::data_size(chunk_size))
             {
-                let state = StringState {
-                    ref_count: 1,
-                    generation: *generation,
-                    string_chunk: last_used_chunk,
-                    lookup_index,
-                };
+                let state = StringState::new_chunk(*generation, last_used_chunk, lookup_index);
 
                 // Increment the generation counter for a new unique string.
                 *generation = generation
@@ -608,12 +680,7 @@ impl StringPool {
                 // Update the `last_used_chunk`.
                 *last_used_chunk = Some(*string_chunk);
 
-                let state = StringState {
-                    ref_count: 1,
-                    generation: *generation,
-                    string_chunk: *string_chunk,
-                    lookup_index,
-                };
+                let state = StringState::new_chunk(*generation, *string_chunk, lookup_index);
 
                 // Increment the generation counter for a new unique string.
                 *generation = generation
@@ -633,16 +700,13 @@ impl StringPool {
         string_chunks.push(new_chunk);
 
         // Must succeed - the chunk is guaranteed to have enough space.
-        if let InternResult::Interned(lookup_index) = unsafe { new_chunk.as_mut() }.intern(string, Self::data_size(chunk_size)) {
+        if let InternResult::Interned(lookup_index) =
+            unsafe { new_chunk.as_mut() }.intern(string, Self::data_size(chunk_size))
+        {
             // Update the `last_used_chunk`.
             *last_used_chunk = Some(new_chunk);
 
-            let state = StringState {
-                ref_count: 1,
-                generation: *generation,
-                string_chunk: new_chunk,
-                lookup_index,
-            };
+            let state = StringState::new_chunk(*generation, new_chunk, lookup_index);
 
             // Increment the generation counter for a new unique string.
             *generation = generation
@@ -676,14 +740,16 @@ impl StringPool {
                         // `remove_gc`'d and not yet `gc`'d.
                         if string_state.ref_count == 0 {
                             if gc {
-                                Self::remove_string_from_chunk(
-                                    string_state.string_chunk,
-                                    string_state.lookup_index,
-                                    string_chunks,
-                                    num_strings,
-                                    gc,
-                                    chunk_size,
-                                );
+                                if let StringStorage::Chunk(string_state) = &string_state.storage {
+                                    Self::remove_string_from_chunk(
+                                        string_state.string_chunk,
+                                        string_state.lookup_index,
+                                        string_chunks,
+                                        num_strings,
+                                        gc,
+                                        chunk_size,
+                                    );
+                                }
 
                                 lookup.remove(&string_id.string_hash);
 
@@ -701,14 +767,16 @@ impl StringPool {
                             // This was the last use of this string - remove it from the chunk
                             // and from the lookup map.
                             if string_state.ref_count == 0 {
-                                Self::remove_string_from_chunk(
-                                    string_state.string_chunk,
-                                    string_state.lookup_index,
-                                    string_chunks,
-                                    num_strings,
-                                    gc,
-                                    chunk_size
-                                );
+                                if let StringStorage::Chunk(string_state) = &string_state.storage {
+                                    Self::remove_string_from_chunk(
+                                        string_state.string_chunk,
+                                        string_state.lookup_index,
+                                        string_chunks,
+                                        num_strings,
+                                        gc,
+                                        chunk_size,
+                                    );
+                                }
 
                                 lookup.remove(&string_id.string_hash);
                             }
@@ -747,14 +815,16 @@ impl StringPool {
                             // `remove_gc`'d and about to be `gc`'d,
                             // or this was the last use of this string when the ref count decremented above.
                             if string_state.ref_count == 0 {
-                                Self::remove_string_from_chunk(
-                                    string_state.string_chunk,
-                                    string_state.lookup_index,
-                                    string_chunks,
-                                    num_strings,
-                                    gc,
-                                    chunk_size
-                                );
+                                if let StringStorage::Chunk(string_state) = &string_state.storage {
+                                    Self::remove_string_from_chunk(
+                                        string_state.string_chunk,
+                                        string_state.lookup_index,
+                                        string_chunks,
+                                        num_strings,
+                                        gc,
+                                        chunk_size,
+                                    );
+                                }
 
                                 // Remove the string from the state array.
                                 states.swap_remove(state_idx);
@@ -794,12 +864,14 @@ impl StringPool {
         string_chunks: &mut Vec<NonNull<StringChunk>>,
         num_strings: &mut u32,
         gc: bool,
-        chunk_size: ChunkSizeInternal
+        chunk_size: ChunkSizeInternal,
     ) {
         let string_chunk = unsafe { string_chunk_ptr.as_mut() };
 
         // This was the last string in the chunk and it's now empty - free it.
-        if let RemoveResult::ChunkFree = string_chunk.remove(lookup_index, Self::data_size(chunk_size)) {
+        if let RemoveResult::ChunkFree =
+            string_chunk.remove(lookup_index, Self::data_size(chunk_size))
+        {
             StringChunk::free(string_chunk_ptr, chunk_size);
             string_chunks.retain(|chunk| *chunk != string_chunk_ptr);
         }
@@ -840,18 +912,18 @@ mod tests {
     }
 
     #[test]
-    fn StringTooLong() {
+    fn hash_collisions() {
+        // See `fnv1a_hash_collisions()`
+
         let mut pool = StringPool::new(CHUNK_SIZE).unwrap();
 
-        const LONG_STRING: &str = "asdfghjkl";
+        let costarring_id = pool.intern("costarring").unwrap();
+        let liquid_id = pool.intern("liquid").unwrap();
 
-        assert_eq!(
-            pool.intern(LONG_STRING),
-            Err(Error::StringTooLong {
-                string_length: LONG_STRING.len(),
-                max_string_length: CHUNK_SIZE
-            })
-        );
+        assert_ne!(costarring_id, liquid_id);
+
+        assert_eq!(pool.lookup(costarring_id).unwrap(), "costarring");
+        assert_eq!(pool.lookup(liquid_id).unwrap(), "liquid");
     }
 
     #[test]

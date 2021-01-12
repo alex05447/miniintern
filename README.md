@@ -25,9 +25,9 @@ One additional benefit is because you control how the interned strings are store
 
 - Create a string pool.
 
-    Pass the desired chunk size in bytes. The pool will allocate the memory for strings internally in these chunks.
+    Pass the desired chunk size in bytes. The pool will allocate the memory for strings internally in these contiguous chunks.
 
-    This value also determines the maximum length of the string in bytes which may be interned in the string pool.
+    This value also determines the maximum length of the string in bytes which may be interned in the chunk. Strings longer than chunk size fall back to individual allocation on the heap.
 
     You may create as many pools as you need. Each pool is completely independent.
 

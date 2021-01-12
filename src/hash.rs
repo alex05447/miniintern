@@ -1,6 +1,6 @@
 pub(crate) type StringHash = u32;
 
-pub(crate) fn fnv1a32(string: &str) -> StringHash {
+pub(crate) fn string_hash_fnv1a(string: &str) -> StringHash {
     const FNV_PRIME: StringHash = 16777619;
     const FNV_OFFSET: StringHash = 2166136261;
 
@@ -16,9 +16,29 @@ pub(crate) fn fnv1a32(string: &str) -> StringHash {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn fnv1a32() {
-        assert_eq!(super::fnv1a32("foo"), 2851307223);
-        assert_eq!(super::fnv1a32("bar"), 1991736602);
+    fn hash() {
+        assert_eq!(string_hash_fnv1a("foo"), 2851307223);
+        assert_eq!(string_hash_fnv1a("bar"), 1991736602);
+    }
+
+    #[test]
+    fn fnv1a_hash_collisions() {
+        // https://softwareengineering.stackexchange.com/questions/49550/which-hashing-algorithm-is-best-for-uniqueness-and-speed
+
+        assert_eq!(string_hash_fnv1a("costarring"), string_hash_fnv1a("liquid"),);
+
+        assert_eq!(
+            string_hash_fnv1a("declinate"),
+            string_hash_fnv1a("macallums"),
+        );
+
+        assert_eq!(string_hash_fnv1a("altarage"), string_hash_fnv1a("zinke"),);
+
+        assert_eq!(string_hash_fnv1a("altarages"), string_hash_fnv1a("zinkes"),);
+
+        assert_ne!(string_hash_fnv1a("foo"), string_hash_fnv1a("bar"),);
     }
 }

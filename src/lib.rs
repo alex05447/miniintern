@@ -10,4 +10,9 @@ mod string_chunk;
 mod string_id;
 mod string_pool;
 
-pub use {error::Error, string_chunk::ChunkSize, string_id::StringID, string_pool::{StringPool, UnsafeStr}};
+pub use {
+    error::Error,
+    string_chunk::ChunkSize,
+    string_id::StringID,
+    string_pool::{StringPool, UnsafeStr},
+};
