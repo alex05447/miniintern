@@ -8,7 +8,7 @@ use {
         },
         string_id::{StringGeneration, StringID},
     },
-    std::{collections::HashMap, ptr::NonNull},
+    std::{collections::HashMap, ptr::NonNull, borrow::Cow},
 };
 
 /// Type for the ref count of interned strings.
@@ -214,7 +214,11 @@ impl StringPool {
     /// [`look it up`]: #method.lookup
     /// [`remove`]: #method.remove
     /// [`string pool`]: struct.StringPool.html
-    pub fn intern(&mut self, string: &str) -> Result<StringID, Error> {
+    pub fn intern<'s, S: Into<Cow<'s, str>>>(&mut self, string: S) -> Result<StringID, Error> {
+        let cow = string.into();
+
+        let string: &str = &cow;
+
         let string_length = string.len();
 
         if string_length == 0 {
@@ -251,7 +255,7 @@ impl StringPool {
                     // Must intern with a new `StringID` and change the string hash's state to `Multiple`.
                     } else {
                         let new_state = Self::intern_new_string(
-                            string,
+                            cow,
                             string_length,
                             &mut self.last_used_chunk,
                             &mut self.string_chunks,
@@ -290,7 +294,7 @@ impl StringPool {
                             string_state.lookup(Self::data_size(self.chunk_size));
 
                         // The strings are the same - increment the ref count and return the existing `StringID`.
-                        if string == looked_up_string {
+                        if cow == looked_up_string {
                             // NOTE - ref count might have been `0` if the string was `remove_gc`'d and not yet `gc`'d -
                             // `gc` will skip strings with non-`0` ref counts.
                             string_state.ref_count = string_state
@@ -308,7 +312,7 @@ impl StringPool {
                     // (Cold case) None of the strings match - we've got yet another hash collision.
                     // Must intern with a new `StringID`.
                     let new_state = Self::intern_new_string(
-                        string,
+                        cow,
                         string_length,
                         &mut self.last_used_chunk,
                         &mut self.string_chunks,
@@ -331,7 +335,7 @@ impl StringPool {
         // Intern it and return the new `StringID`.
         } else {
             let new_state = Self::intern_new_string(
-                string,
+                cow,
                 string_length,
                 &mut self.last_used_chunk,
                 &mut self.string_chunks,
@@ -622,8 +626,8 @@ impl StringPool {
         }
     }
 
-    fn intern_new_string(
-        string: &str,
+    fn intern_new_string<'s>(
+        cow: Cow<'s, str>,
         length: usize,
         last_used_chunk: &mut Option<NonNull<StringChunk>>,
         string_chunks: &mut Vec<NonNull<StringChunk>>,
@@ -631,10 +635,12 @@ impl StringPool {
         generation: &mut StringGeneration,
         chunk_size: ChunkSizeInternal,
     ) -> StringState {
+        let string = &cow;
+
         debug_assert_eq!(string.len(), length);
 
         if length > Self::data_size(chunk_size) as usize {
-            let state = StringState::new_string(*generation, string.to_owned());
+            let state = StringState::new_string(*generation, cow.into_owned());
 
             // Increment the generation counter for a new unique string.
             *generation = generation
