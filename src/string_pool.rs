@@ -166,7 +166,7 @@ impl StringPool {
     /// Strings longer than chunk size are allocated on the heap individually.
     ///
     /// [`string pool`]: struct.StringPool.html
-    pub fn new(chunk_size: ChunkSize) -> Result<Self, Error> {
+    pub fn new(chunk_size: ChunkSize) -> Self {
         let mut chunk_size = chunk_size.get();
 
         // Must at least have enough space for the header.
@@ -174,7 +174,7 @@ impl StringPool {
             chunk_size += STRING_CHUNK_HEADER_SIZE
         }
 
-        Ok(Self {
+        Self {
             chunk_size,
             lookup: HashMap::new(),
             num_strings: 0,
@@ -182,7 +182,7 @@ impl StringPool {
             string_chunks: Vec::new(),
             last_used_chunk: None,
             gc: Vec::new(),
-        })
+        }
     }
 
     /// Returns the number of unique interned strings in the [`string pool`].
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn EmptyString() {
-        let mut pool = StringPool::new(CHUNK_SIZE).unwrap();
+        let mut pool = StringPool::new(CHUNK_SIZE);
 
         assert_eq!(pool.intern(""), Err(Error::EmptyString));
     }
@@ -921,7 +921,7 @@ mod tests {
     fn hash_collisions() {
         // See `fnv1a_hash_collisions()`
 
-        let mut pool = StringPool::new(CHUNK_SIZE).unwrap();
+        let mut pool = StringPool::new(CHUNK_SIZE);
 
         let costarring_id = pool.intern("costarring").unwrap();
         let liquid_id = pool.intern("liquid").unwrap();
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn string_pool() {
-        let mut pool = StringPool::new(CHUNK_SIZE).unwrap();
+        let mut pool = StringPool::new(CHUNK_SIZE);
 
         assert_eq!(pool.len(), 0);
 
