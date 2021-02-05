@@ -8,7 +8,7 @@ use {
         },
         string_id::{StringGeneration, StringID},
     },
-    std::{collections::HashMap, ptr::NonNull, borrow::Cow},
+    std::{collections::{HashMap, hash_map::Iter as HashMapIter}, slice::Iter as SliceIter, iter::Iterator, ptr::NonNull, borrow::Cow},
 };
 
 /// Type for the ref count of interned strings.
@@ -215,7 +215,7 @@ impl StringPool {
     /// [`remove`]: #method.remove
     /// [`string pool`]: struct.StringPool.html
     pub fn intern<'s, S: Into<Cow<'s, str>>>(&mut self, string: S) -> Result<StringID, Error> {
-        let cow = string.into();
+        let cow: Cow<'_, str> = string.into();
 
         let string: &str = &cow;
 
@@ -420,41 +420,19 @@ impl StringPool {
     /// [`intern`]: #method.intern
     /// [`string_id`]: struct.StringID.html
     pub fn lookup(&self, string_id: StringID) -> Result<&str, Error> {
-        let lookup_in_state =
-            |state: &StringState, generation: StringGeneration| -> Result<&str, Error> {
-                // Generations match - the `string_id` is valid
-                // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
-                if state.generation == generation {
-                    // Attempted to look up a stale `string_id` which was `remove_gc`'d and not yet `gc`'d.
-                    if state.ref_count == 0 {
-                        Err(Error::InvalidStringID)
-                    } else {
-                        // TODO - review the safety of this.
-                        Ok(unsafe {
-                            std::mem::transmute(state.lookup(Self::data_size(self.chunk_size)))
-                        })
-                    }
-
-                // Else, mismatched generations - the `string_id` is for a hash-colliding string,
-                // or is stale (or even from a different string pool).
-                } else {
-                    Err(Error::InvalidStringID)
-                }
-            };
-
         // The string with this hash was interned (but might have been `remove_gc`'d and not yet `gc`'d).
         if let Some(hash_state) = self.lookup.get(&string_id.string_hash) {
             match hash_state {
                 // There's a single string with this hash.
                 HashState::Single(string_state) => {
-                    lookup_in_state(string_state, string_id.generation)
+                    self.lookup_in_state(string_state, string_id.generation)
                 }
                 // (Cold case) There are multiple strings with this hash.
                 HashState::Multiple(states) => {
                     debug_assert!(states.len() > 1);
 
                     for string_state in states.iter() {
-                        if let Ok(string) = lookup_in_state(string_state, string_id.generation) {
+                        if let Ok(string) = self.lookup_in_state(string_state, string_id.generation) {
                             return Ok(string);
                         }
                     }
@@ -623,6 +601,15 @@ impl StringPool {
                 true,
                 self.chunk_size,
             );
+        }
+    }
+
+    /// Returns an iterator over all strings interned in the pool.
+    pub fn iter(&self) -> impl Iterator<Item = (StringID, &'_ str)> {
+        StringPoolIter {
+            pool: &self,
+            iter: self.lookup.iter(),
+            colliding_iter: None,
         }
     }
 
@@ -892,6 +879,101 @@ impl StringPool {
         debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
         chunk_size - STRING_CHUNK_HEADER_SIZE
     }
+
+    fn lookup_in_state(&self, state: &StringState, generation: StringGeneration) -> Result<&str, Error> {
+        // Generations match - the `string_id` is valid
+        // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
+        if state.generation == generation {
+            // Attempted to look up a stale `string_id` which was `remove_gc`'d and not yet `gc`'d.
+            if state.ref_count == 0 {
+                Err(Error::InvalidStringID)
+            } else {
+                // TODO - review the safety of this.
+                Ok(unsafe {
+                    std::mem::transmute(state.lookup(Self::data_size(self.chunk_size)))
+                })
+            }
+
+        // Else, mismatched generations - the `string_id` is for a hash-colliding string,
+        // or is stale (or even from a different string pool).
+        } else {
+            Err(Error::InvalidStringID)
+        }
+    }
+
+    fn lookup_in_state_impl(&self, state: &StringState) -> Option<(&str, StringGeneration)> {
+        if state.ref_count > 0 {
+            Some((
+                unsafe {
+                    std::mem::transmute(state.lookup(Self::data_size(self.chunk_size)))
+                },
+                state.generation
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+struct StringPoolIter<'a> {
+    pool: &'a StringPool,
+    iter: HashMapIter<'a, StringHash, HashState>,
+    colliding_iter: Option<(StringHash, SliceIter<'a, StringState>)>,
+}
+
+impl<'a> Iterator for StringPoolIter<'a> {
+    type Item = (StringID, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((string_hash, mut colliding_iter)) = self.colliding_iter.take() {
+            while let Some(string_state) = colliding_iter.next() {
+                if let Some((string, generation)) = self.pool.lookup_in_state_impl(string_state) {
+                    let string_id = StringID {
+                        string_hash, generation
+                    };
+
+                    self.colliding_iter.replace((string_hash, colliding_iter));
+
+                    return Some((string_id, string));
+                }
+            }
+        }
+
+        debug_assert!(self.colliding_iter.is_none());
+
+        while let Some((&string_hash, hash_state)) = self.iter.next() {
+            match hash_state {
+                HashState::Single(string_state) => {
+                    if let Some((string, generation)) = self.pool.lookup_in_state_impl(string_state) {
+                        let string_id = StringID {
+                            string_hash, generation
+                        };
+
+                        return Some((string_id, string));
+                    }
+                },
+                HashState::Multiple(string_states) => {
+                    debug_assert!(string_states.len() > 1);
+
+                    let mut colliding_iter = string_states.iter();
+
+                    while let Some(string_state) = colliding_iter.next() {
+                        if let Some((string, generation)) = self.pool.lookup_in_state_impl(string_state) {
+                            self.colliding_iter.replace((string_hash, colliding_iter));
+
+                            let string_id = StringID {
+                                string_hash, generation
+                            };
+
+                            return Some((string_id, string));
+                        }
+                    }
+                },
+            }
+        }
+
+        None
+    }
 }
 
 impl Drop for StringPool {
@@ -1038,5 +1120,45 @@ mod tests {
         assert_eq!(pool.lookup(asdf_id), Err(Error::InvalidStringID));
         assert_eq!(pool.lookup(gh_id), Err(Error::InvalidStringID));
         assert_eq!(pool.lookup(long_string_id), Err(Error::InvalidStringID));
+    }
+
+    #[test]
+    fn iter() {
+        let mut pool = StringPool::new(CHUNK_SIZE);
+
+        // Including large strings ("costarring") and colliding strings ("costarring" and "liquid").
+        let strings = ["foo", "bar", "baz", "bill", "bob", "barry", "costarring", "liquid"];
+
+        let mut bob_id = None;
+
+        for &string in &strings {
+            let id = pool.intern(string).unwrap();
+
+            if string == "bob" {
+                bob_id.replace(id);
+            }
+        }
+
+        for (_, string) in pool.iter() {
+            assert!(strings.contains(&string));
+        }
+
+        assert_eq!(
+            pool.iter().count(),
+            pool.len()
+        );
+
+        pool.remove(bob_id.unwrap()).unwrap();
+
+        for (string_id, string) in pool.iter() {
+            assert!(strings.contains(&string));
+            assert_ne!(string, "bob");
+            assert_ne!(string_id, bob_id.unwrap());
+        }
+
+        assert_eq!(
+            pool.iter().count(),
+            pool.len()
+        );
     }
 }

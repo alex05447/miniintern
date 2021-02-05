@@ -15,3 +15,13 @@ pub struct StringID {
     pub(crate) string_hash: StringHash,
     pub(crate) generation: StringGeneration,
 }
+
+impl Default for StringID {
+    fn default() -> Self {
+        // TODO - check for correctness.
+        Self {
+            string_hash: StringHash::MAX,
+            generation: StringGeneration::MAX,
+        }
+    }
+}
