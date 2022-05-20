@@ -25,11 +25,11 @@ One additional benefit is because you control how the interned strings are store
 
 - Create a string `Pool`.
 
-    Pass the desired chunk size in bytes. The pool will allocate memory for strings internally in these contiguous chunks.
+    Pass the desired chunk size in bytes. The `Pool` will allocate memory for strings internally in these contiguous chunks.
 
     This value also determines the maximum length of the string in bytes which may be interned in the chunk. Strings longer than chunk size fall back to individual allocation on the heap.
 
-    You may create as many `Pool`'s as you need. Each pool is completely independent.
+    You may create as many `Pool`'s as you need. Each `Pool` is completely independent.
     (However, string `ID`'s from different `Pool`'s must not be mixed).
 
     ```rust
@@ -43,7 +43,7 @@ One additional benefit is because you control how the interned strings are store
     let foo_id = pool.intern(foo).unwrap();
     ```
 
-    This stores the string slice's copy in the pool's internal memory and returns an `ID` - an opaque POD type.
+    This stores the string slice's copy in the `Pool`'s internal memory and returns an `ID` - an opaque POD type.
     `ID`'s may be compared. Equal strings have equal `ID`'s, and vice versa (as long as both `ID`'s are valid and were returned by the same `Pool`).
 
     Comparing `ID`'s returned by different `Pool`'s is undefined.
@@ -58,7 +58,7 @@ One additional benefit is because you control how the interned strings are store
     assert_eq!(foo_id, other_foo_id);
     ```
 
-- Look up the interned string in the pool:
+- Look up the interned string in the `Pool`:
 
     ```rust
     let foo = pool.lookup(foo_id).unwrap();
@@ -68,7 +68,7 @@ One additional benefit is because you control how the interned strings are store
     assert_eq!(other_foo, "foo");
     ```
 
-- Remove the string from the pool:
+- Remove the string from the `Pool`:
 
     ```rust
     pool.remove(foo_id).unwrap();
