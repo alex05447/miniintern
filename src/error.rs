@@ -3,17 +3,19 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+/// An error returned by the [`Pool`](crate::Pool).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error {
-    /// Attempted to [`intern`] an empty (zero-length) string.
-    /// [`intern`]: struct.StringPool.html#method.intern
+    /// Attempted to [`intern`](crate::Pool::intern) an empty (zero-length) string.
     EmptyString,
-    /// `StringID` was invalid.
+    /// `ID` was invalid.
     InvalidStringID,
     /// String reference counter overflowed.
-    /// Contains the maximum number of string copies the [`string pool`] may intern.
-    /// [`string pool`]: struct.StringPool.html
+    /// Contains the maximum number of string copies the [`Pool`](crate::Pool) may intern.
     RefCountOverflow(usize),
+    /// String counter overflowed.
+    /// Contains the maximum number of unique strings the [`Pool`](crate::Pool) may intern.
+    StringCountOverflow(usize),
 }
 
 impl StdError for Error {}
@@ -29,6 +31,11 @@ impl Display for Error {
                 f,
                 "string reference counter overflowed (max value is {})",
                 max_num_copies
+            ),
+            StringCountOverflow(max_num_strings) => write!(
+                f,
+                "string counter overflowed (max value is {})",
+                max_num_strings
             ),
         }
     }

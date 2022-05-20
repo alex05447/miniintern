@@ -1,13 +1,13 @@
-pub(crate) type StringHash = u32;
+pub(crate) type Hash = u32;
 
-pub(crate) fn string_hash_fnv1a(string: &str) -> StringHash {
-    const FNV_PRIME: StringHash = 16777619;
-    const FNV_OFFSET: StringHash = 2166136261;
+pub(crate) fn string_hash_fnv1a(string: &str) -> Hash {
+    const FNV_PRIME: Hash = 16777619;
+    const FNV_OFFSET: Hash = 2166136261;
 
     let mut hash = FNV_OFFSET;
 
     for byte in string.bytes() {
-        hash = hash ^ byte as StringHash;
+        hash = hash ^ byte as Hash;
         hash = hash.overflowing_mul(FNV_PRIME).0;
     }
 

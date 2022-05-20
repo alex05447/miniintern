@@ -1,18 +1,23 @@
 //! # miniintern
 //!
-//! Minimalistic string interning / string pool library written in Rust.
+//! A minimalistic Rust string interning / pooling library.
 //!
 //! Originally written for `miniecs` string support in component data.
 
+mod chunk;
 mod error;
 mod hash;
-mod string_chunk;
-mod string_id;
-mod string_pool;
+mod id;
+mod pool;
 
-pub use {
-    error::Error,
-    string_chunk::ChunkSize,
-    string_id::StringID,
-    string_pool::{StringPool, UnsafeStr},
-};
+pub use {chunk::*, error::*, id::*, pool::*};
+
+pub(crate) use hash::*;
+
+pub(crate) fn debug_unreachable() -> ! {
+    if cfg!(debug_assertions) {
+        unreachable!()
+    } else {
+        unsafe { std::hint::unreachable_unchecked() }
+    }
+}

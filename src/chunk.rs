@@ -1,14 +1,12 @@
-use std::{num::NonZeroU16, ptr::NonNull};
+use std::{mem, num::NonZeroU16, ptr::NonNull};
 
-/// Type for the size in bytes of the string chunks the [`string pool`] allocates internally for string storage.
+/// Type for the size in bytes of the string chunks the [`Pool`](crate::Pool) allocates internally for string storage.
 ///
 /// NOTE - currently, maximum chunk size is `std::u16::MAX`, which (minus the (small) string chunk header overhead)
 /// determines the maximum length in bytes of the string which can be interned in the chunk by the [`string pool`].
 /// Strings longer than this are allocated on the heap individually.
 ///
 /// NOTE - when changing the underlying type, also change the `StringOffset` / `StringLength` / `LookupIndex` types.
-///
-/// [`string pool`]: struct.StringPool.html
 pub type ChunkSize = NonZeroU16;
 
 pub(crate) type ChunkSizeInternal = u16;
@@ -21,35 +19,37 @@ pub(crate) type LookupIndex = u16;
 /// Type for string offset within the string chunk's buffer.
 ///
 /// NOTE - make sure the underlying type matches the `ChunkSize` type above.
-type StringOffset = u16;
+pub(crate) type Offset = u16;
 
 /// Used to indicate an invalid value for the string chunk free linked list index.
-const INVALID_INDEX: StringOffset = StringOffset::MAX;
+const INVALID_INDEX: Offset = Offset::MAX;
 
 /// Type for string length within the string chunk buffer.
 ///
 /// NOTE - make sure the underlying type matches the `ChunkSize` type above.
-type StringLength = u16;
+type Length = u16;
 
 /// NOTE - we do not allow interning empty strings (and we do allow `std::u16::MAX` long strings),
 /// so we can use `0` as a special value which means an unoccupied string chunk entry.
-const INVALID_LENGTH: u16 = 0;
+const INVALID_LENGTH: Length = 0;
 
-/// Invalid UTF-8 byte sequence, used to fill the unused space in the string chunks.
-//#[cfg(debug)]
+/// Invalid UTF-8 byte sequence, used to fill the unused space in the string chunks in debug configuration.
 const CHUNK_FILL_VALUE: u8 = b'\xc0';
 
-pub(crate) const STRING_CHUNK_HEADER_SIZE: ChunkSizeInternal =
-    std::mem::size_of::<StringChunk>() as _;
+pub(crate) const STRING_CHUNK_HEADER_SIZE: ChunkSizeInternal = mem::size_of::<Chunk>() as _;
 
+/// Returned by `Chunk::intern`.
 pub(crate) enum InternResult {
-    /// Not enough free space left in the chunk.
+    /// Did not intern - not enough free space left in the chunk.
+    /// NOTE - this is never returned because the string was too large for our chunk size,
+    /// as we handle that case beforehand.
     NoSpace,
     /// Successfully interned the string.
     /// Contains the index of the string in the chunk's lookup array.
     Interned(LookupIndex),
 }
 
+/// Returned by `Chunk::remove`.
 pub(crate) enum RemoveResult {
     /// Chunk still has some strings in it.
     ChunkInUse,
@@ -62,41 +62,43 @@ pub(crate) enum RemoveResult {
 pub(crate) struct StringInChunk {
     /// String start offset in bytes from `data` array start.
     /// Also used as the lookup array entry free list node, or `INVALID_INDEX`.
-    offset: StringOffset,
-    /// (non-null) string length in bytes.
-    length: StringLength,
+    offset: Offset,
+    /// (Non-null) string length in bytes,
+    /// or `INVALID_LENGTH` if used as the lookup array entry free list node.
+    length: Length,
 }
 
 /// A fixed-size memory chunk used to store interned strings.
-pub(crate) struct StringChunk {
+/// This struct is the chunk's header and is located at the start of its data buffer,
+/// taking up dome space.
+pub(crate) struct Chunk {
     /// The chunk's string data buffer.
+    /// Points past the chunk's header.
     /// The string pool knows its size and passes it down when necessary.
     data: *mut u8,
     /// Num of bytes in `data` array containing string bytes.
     occupied_bytes: ChunkSizeInternal,
     /// First free byte in the `data` array.
-    first_free_byte: StringOffset,
+    first_free_byte: Offset,
     /// Starts `false`.
     /// Set to `true` when interning, whenever occupancy reaches >50%.
     /// Set to `false` when removing, whenever occupancy reaches <50% and the chunk is defragmented.
     fragmented: bool,
-    /// Lookup array which maps `StringState::lookup_index` to string offsets/lengths within the chunk data buffer.
+    /// Lookup array which maps the string's stable `StringState::lookup_index` to its offset/length within the chunk's data buffer.
     lookup: Vec<StringInChunk>,
     /// First free index in the lookup array, or `INVALID_INDEX`.
     /// Free lookup array entries form a linked list via their `offset` field.
-    first_free_index: StringOffset,
-    /// Scratch pad vec used for defragmenting.
-    /// Persisted to avoid allocating a new one in each call to `defragment()`.
-    /// TODO: investigate if it's worth it.
-    string_offsets: Vec<(StringInChunk, StringOffset)>,
+    first_free_index: Offset,
 }
 
-impl StringChunk {
-    /// Allocates a new `StringChunk` on the heap.
+impl Chunk {
+    /// Allocates a new `Chunk` on the heap.
     pub(crate) fn allocate(chunk_size: ChunkSizeInternal) -> NonNull<Self> {
         // Ensured by the caller.
         debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
 
+        // Allocate the chunk's data buffer.
+        // Fill it with UTF-8 garbage in debug configuration.
         let ptr = malloc(
             chunk_size as _,
             if cfg!(debug_assertions) {
@@ -107,6 +109,9 @@ impl StringChunk {
         )
         .as_ptr();
 
+        // Create the chunk's header, passing it the offset data buffer pointer,
+        // and write the header at the start of the buffer.
+
         let data = unsafe { ptr.offset(STRING_CHUNK_HEADER_SIZE as _) };
 
         let chunk = Self::new(data);
@@ -116,10 +121,10 @@ impl StringChunk {
         unsafe { NonNull::new_unchecked(ptr as _) }
     }
 
-    /// Cleans up and frees the `StringChunk`.
-    pub(crate) fn free(ptr: NonNull<StringChunk>, chunk_size: ChunkSizeInternal) {
+    /// Cleans up and frees the `Chunk`.
+    pub(crate) fn free(ptr: NonNull<Chunk>, chunk_size: ChunkSizeInternal) {
         let chunk = unsafe { std::ptr::read_unaligned(ptr.as_ptr()) };
-        std::mem::drop(chunk);
+        mem::drop(chunk);
 
         free(
             unsafe { NonNull::new_unchecked(ptr.as_ptr() as _) },
@@ -127,12 +132,13 @@ impl StringChunk {
         );
     }
 
-    /// Tries to intern the string in this chunk.
+    /// Tries to intern the `string` in this chunk.
+    /// `data_size` is the maximum useful size in bytes of the string chunk's buffer (i.e. excluding the header).
+    ///
+    /// Caller guarantees `string` fits in `data_size`.
     pub(crate) fn intern(&mut self, string: &str, data_size: ChunkSizeInternal) -> InternResult {
-        let length = string.len();
-        // NOTE - guaranteed to fit by the calling code.
-        debug_assert!(length <= data_size as usize);
-        let length = length as StringLength;
+        let length = string.len() as Length;
+        debug_assert!(length <= data_size);
 
         debug_assert!(data_size >= self.first_free_byte);
         let remaining_bytes = data_size - self.first_free_byte;
@@ -146,14 +152,14 @@ impl StringChunk {
 
         // Get the lookup index from the free list, or allocate a new element.
         let lookup_index = if self.first_free_index != INVALID_INDEX {
-            let lookup_index = self.first_free_index as usize;
-            debug_assert!(lookup_index < self.lookup.len());
-            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index) };
+            let lookup_index = self.first_free_index;
+            debug_assert!((lookup_index as usize) < self.lookup.len());
+            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index as usize) };
             debug_assert_eq!(string_in_chunk.length, INVALID_LENGTH);
             self.first_free_index = string_in_chunk.offset;
             string_in_chunk.offset = offset;
             string_in_chunk.length = length;
-            lookup_index as LookupIndex
+            lookup_index
         } else {
             let lookup_index = self.lookup.len() as LookupIndex;
             self.lookup.push(StringInChunk { offset, length });
@@ -171,6 +177,7 @@ impl StringChunk {
             self.fragmented = true;
         }
 
+        // COpy the string's data into the allocated space in the chunk.
         let src = string.as_bytes().as_ptr();
         let dst = unsafe { self.data.offset(offset as _) };
 
@@ -182,13 +189,21 @@ impl StringChunk {
     }
 
     /// Looks up the string in this chunk given its `lookup_index`.
+    ///
+    /// `data_size` is the maximum useful size in bytes of the string chunk's buffer (i.e. excluding the header),
+    /// only used for a debug bounds check.
+    ///
     /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
     pub(crate) fn lookup(&self, lookup_index: LookupIndex, data_size: ChunkSizeInternal) -> &str {
+        // Lookup the string's offset/lenght in the chunk using its stable `lookup_index`.
         let lookup_index = lookup_index as usize;
         debug_assert!(lookup_index < self.lookup.len());
         let string_in_chunk = unsafe { self.lookup.get_unchecked(lookup_index) };
-        debug_assert!(string_in_chunk.offset < data_size);
-        debug_assert!(string_in_chunk.length <= data_size);
+
+        debug_assert!(
+            (string_in_chunk.offset + string_in_chunk.length) <= data_size,
+            "string in chunk is out of bounds"
+        );
 
         unsafe {
             let src = self.data.offset(string_in_chunk.offset as isize);
@@ -202,16 +217,20 @@ impl StringChunk {
     }
 
     /// Removes the string from this chunk given its `lookup_index`.
+    /// Also defragments the string chunk if it was fragmented and this causes its occupancy to drop below 50%.
+    ///
+    /// `data_size` is the maximum useful size in bytes of the string chunk's buffer (i.e. excluding the header),
+    ///
     /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
     pub(crate) fn remove(
         &mut self,
-        lookup_index: LookupIndex,
+        index: LookupIndex,
         data_size: ChunkSizeInternal,
+        offsets: &mut Vec<(StringInChunk, Offset)>,
     ) -> RemoveResult {
-        debug_assert!((lookup_index as usize) < self.lookup.len());
-        let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index as usize) };
-        debug_assert!(string_in_chunk.offset < data_size);
-        debug_assert!(string_in_chunk.length <= data_size);
+        debug_assert!((index as usize) < self.lookup.len());
+        let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(index as usize) };
+        debug_assert!((string_in_chunk.offset + string_in_chunk.length) <= data_size);
 
         // Fill the now empty space with garbage.
         if cfg!(debug_assertions) {
@@ -231,11 +250,11 @@ impl StringChunk {
         // Put this lookup entry on the free list.
         string_in_chunk.offset = self.first_free_index;
         string_in_chunk.length = INVALID_LENGTH;
-        self.first_free_index = lookup_index;
+        self.first_free_index = index;
 
         // Defragment if <50% occupied and not already defragmented.
         if self.needs_to_defragment(data_size) {
-            self.defragment(data_size);
+            self.defragment(data_size, offsets);
         }
 
         RemoveResult::ChunkInUse
@@ -249,7 +268,6 @@ impl StringChunk {
             fragmented: false,
             lookup: Vec::new(),
             first_free_index: INVALID_INDEX,
-            string_offsets: Vec::new(),
         }
     }
 
@@ -258,38 +276,34 @@ impl StringChunk {
     }
 
     #[cold]
-    fn defragment(&mut self, data_size: ChunkSizeInternal) {
+    fn defragment(
+        &mut self,
+        data_size: ChunkSizeInternal,
+        offsets: &mut Vec<(StringInChunk, Offset)>,
+    ) {
         debug_assert!(self.fragmented);
 
         // Gather the string ranges.
         // Tuples of (current string offset/length, new string offset).
-        debug_assert!(self.string_offsets.is_empty());
-        self.string_offsets
-            .extend(self.lookup.iter().filter_map(|string_in_chunk| {
-                // Skip the free entries.
-                if string_in_chunk.length == INVALID_LENGTH {
-                    None
-                } else {
-                    Some((*string_in_chunk, 0))
-                }
-            }));
+        debug_assert!(offsets.is_empty());
+        offsets.extend(self.lookup.iter().filter_map(|string_in_chunk| {
+            // Skip the free entries.
+            (string_in_chunk.length != INVALID_LENGTH).then(|| (*string_in_chunk, 0))
+        }));
 
         // Sanity check - string lengths must add up to chunk's occupied bytes.
         debug_assert_eq!(
-            self.string_offsets
-                .iter()
-                .fold(0, |sum, el| { sum + el.0.length }),
+            offsets.iter().map(|(el, _)| el.length).sum::<u16>(),
             self.occupied_bytes
         );
 
         // Sort by current offset.
-        self.string_offsets
-            .sort_by(|l, r| l.0.offset.cmp(&r.0.offset));
+        offsets.sort_by(|l, r| l.0.offset.cmp(&r.0.offset));
 
         // Compact.
         let mut offset = 0;
 
-        for (string_in_chunk, new_offset) in self.string_offsets.iter_mut() {
+        for (string_in_chunk, new_offset) in offsets.iter_mut() {
             unsafe {
                 let src = self.data.offset(string_in_chunk.offset as _);
                 let dst = self.data.offset(offset as _);
@@ -313,23 +327,24 @@ impl StringChunk {
             if remaining_bytes > 0 {
                 unsafe {
                     let dst = self.data.offset(self.first_free_byte as isize);
-
                     std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, remaining_bytes as usize);
                 }
             }
         }
 
         // Patch the string offsets.
-        for (new_string, new_offset) in self.string_offsets.iter() {
-            let found = self
+        for (new_string, new_offset) in offsets.iter() {
+            // NOTE - always succeeds.
+            if let Some(found) = self
                 .lookup
                 .iter_mut()
                 .find(|old_string| old_string.offset == new_string.offset)
-                .unwrap();
-            found.offset = *new_offset;
+            {
+                found.offset = *new_offset;
+            }
         }
 
-        self.string_offsets.clear();
+        offsets.clear();
 
         self.fragmented = false;
     }
@@ -338,13 +353,13 @@ impl StringChunk {
 fn malloc(size: usize, val: u8) -> NonNull<u8> {
     let mut vec = vec![val; size];
     let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
+    mem::forget(vec);
     NonNull::new(ptr).expect("out of memory")
 }
 
 fn free(ptr: NonNull<u8>, size: usize) {
     let vec = unsafe { Vec::from_raw_parts(ptr.as_ptr(), size, size) };
-    std::mem::drop(vec);
+    mem::drop(vec);
 }
 
 #[cfg(test)]
@@ -358,7 +373,7 @@ mod tests {
         const SMALL_CHUNK_SIZE: ChunkSizeInternal =
             SMALL_CHUNK_DATA_SIZE + STRING_CHUNK_HEADER_SIZE;
 
-        let mut chunk = StringChunk::allocate(SMALL_CHUNK_SIZE);
+        let mut chunk = Chunk::allocate(SMALL_CHUNK_SIZE);
 
         let chunk_ref = unsafe { chunk.as_mut() };
 
@@ -425,8 +440,10 @@ mod tests {
             InternResult::NoSpace
         ));
 
+        let mut string_offsets = Vec::new();
+
         assert!(matches!(
-            chunk_ref.remove(foo_idx, SMALL_CHUNK_DATA_SIZE),
+            chunk_ref.remove(foo_idx, SMALL_CHUNK_DATA_SIZE, &mut string_offsets),
             RemoveResult::ChunkInUse
         ));
 
@@ -478,7 +495,7 @@ mod tests {
         assert_eq!(chunk_ref.lookup(baz_idx, SMALL_CHUNK_DATA_SIZE), "baz");
 
         assert!(matches!(
-            chunk_ref.remove(bar_idx, SMALL_CHUNK_DATA_SIZE),
+            chunk_ref.remove(bar_idx, SMALL_CHUNK_DATA_SIZE, &mut string_offsets),
             RemoveResult::ChunkInUse
         ));
 
@@ -501,11 +518,11 @@ mod tests {
         assert_eq!(chunk_ref.first_free_index, 1);
 
         assert!(matches!(
-            chunk_ref.remove(baz_idx, SMALL_CHUNK_DATA_SIZE),
+            chunk_ref.remove(baz_idx, SMALL_CHUNK_DATA_SIZE, &mut string_offsets),
             RemoveResult::ChunkFree
         ));
 
-        StringChunk::free(chunk, SMALL_CHUNK_SIZE);
+        Chunk::free(chunk, SMALL_CHUNK_SIZE);
 
         const LARGE_CHUNK_SIZE: ChunkSizeInternal = 256;
         assert!(LARGE_CHUNK_SIZE > STRING_CHUNK_HEADER_SIZE);
@@ -513,7 +530,7 @@ mod tests {
         const LARGE_CHUNK_DATA_SIZE: ChunkSizeInternal =
             LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;
 
-        let mut chunk = StringChunk::allocate(LARGE_CHUNK_SIZE);
+        let mut chunk = Chunk::allocate(LARGE_CHUNK_SIZE);
 
         let chunk_ref = unsafe { chunk.as_mut() };
 
@@ -551,10 +568,10 @@ mod tests {
         );
 
         assert!(matches!(
-            chunk_ref.remove(large_string_idx, LARGE_CHUNK_DATA_SIZE),
+            chunk_ref.remove(large_string_idx, LARGE_CHUNK_DATA_SIZE, &mut string_offsets),
             RemoveResult::ChunkFree
         ));
 
-        StringChunk::free(chunk, LARGE_CHUNK_SIZE);
+        Chunk::free(chunk, LARGE_CHUNK_SIZE);
     }
 }
