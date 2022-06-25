@@ -1,6 +1,7 @@
 use {
     crate::*,
     minimultimap::*,
+    miniunchecked::*,
     std::{borrow::Cow, iter::Iterator, ptr::NonNull},
 };
 
@@ -520,14 +521,10 @@ impl Pool {
         string_chunks.push(new_chunk);
 
         // Must succeed - the chunk is guaranteed to have enough space.
-        match intern_in_chunk(new_chunk) {
-            Some(res) => {
-                // Update the `last_used_chunk`.
-                *last_used_chunk = Some(new_chunk);
-                res
-            }
-            None => debug_unreachable(),
-        }
+        let res = unsafe { intern_in_chunk(new_chunk).unwrap_unchecked_dbg() };
+        // Update the `last_used_chunk`.
+        *last_used_chunk = Some(new_chunk);
+        res
     }
 
     fn remove_string(
@@ -620,7 +617,7 @@ impl Pool {
         chunk_size - STRING_CHUNK_HEADER_SIZE
     }
 
-    fn lookup_in_state(&self, state: &State, generation: Generation) -> Option<&str> {
+    fn lookup_in_state<'a>(&self, state: &'a State, generation: Generation) -> Option<&'a str> {
         // Generations match - the `id` is valid
         // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
         if state.generation == generation {
@@ -633,11 +630,10 @@ impl Pool {
         }
     }
 
-    fn lookup_in_state_impl(&self, state: &State) -> Option<(&str, Generation)> {
+    fn lookup_in_state_impl<'a>(&self, state: &'a State) -> Option<(&'a str, Generation)> {
         if state.ref_count > 0 {
-            // TODO - review the safety of this.
             Some((
-                unsafe { std::mem::transmute(state.lookup(Self::data_size(self.chunk_size))) },
+                state.lookup(Self::data_size(self.chunk_size)),
                 state.generation,
             ))
         // Attempted to look up a stale `id` which was `remove_gc`'d and not yet `gc`'d.

@@ -120,7 +120,7 @@ obtain (write) lock, garbage collect with `gc()`.
 
 ## **Implementation details**
 
-When interned, the strings are hashed to a 32-bit unsigned integer.
+When interned, the strings are hashed to a 32-bit unsigned integer (currently using FNV-1a).
 
 The `Pool` has a lookup hash map from this hash to the string's state - its ref count and location in a string chunk.
 

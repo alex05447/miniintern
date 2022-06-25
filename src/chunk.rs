@@ -1,4 +1,7 @@
-use std::{mem, num::NonZeroU16, ptr::NonNull};
+use {
+    miniunchecked::*,
+    std::{mem, num::NonZeroU16, ptr::NonNull},
+};
 
 /// Type for the size in bytes of the string chunks the [`Pool`](crate::Pool) allocates internally for string storage.
 ///
@@ -153,8 +156,8 @@ impl Chunk {
         // Get the lookup index from the free list, or allocate a new element.
         let lookup_index = if self.first_free_index != INVALID_INDEX {
             let lookup_index = self.first_free_index;
-            debug_assert!((lookup_index as usize) < self.lookup.len());
-            let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(lookup_index as usize) };
+            let string_in_chunk =
+                unsafe { self.lookup.get_unchecked_mut_dbg(lookup_index as usize) };
             debug_assert_eq!(string_in_chunk.length, INVALID_LENGTH);
             self.first_free_index = string_in_chunk.offset;
             string_in_chunk.offset = offset;
@@ -197,8 +200,7 @@ impl Chunk {
     pub(crate) fn lookup(&self, lookup_index: LookupIndex, data_size: ChunkSizeInternal) -> &str {
         // Lookup the string's offset/lenght in the chunk using its stable `lookup_index`.
         let lookup_index = lookup_index as usize;
-        debug_assert!(lookup_index < self.lookup.len());
-        let string_in_chunk = unsafe { self.lookup.get_unchecked(lookup_index) };
+        let string_in_chunk = unsafe { self.lookup.get_unchecked_dbg(lookup_index) };
 
         debug_assert!(
             (string_in_chunk.offset + string_in_chunk.length) <= data_size,
@@ -216,20 +218,19 @@ impl Chunk {
         }
     }
 
-    /// Removes the string from this chunk given its `lookup_index`.
+    /// Removes the string from this chunk given its lookup `index`.
     /// Also defragments the string chunk if it was fragmented and this causes its occupancy to drop below 50%.
     ///
     /// `data_size` is the maximum useful size in bytes of the string chunk's buffer (i.e. excluding the header),
     ///
-    /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
+    /// NOTE - the caller guarantees `index` is valid, so the call always succeeds.
     pub(crate) fn remove(
         &mut self,
         index: LookupIndex,
         data_size: ChunkSizeInternal,
         offsets: &mut Vec<(StringInChunk, Offset)>,
     ) -> RemoveResult {
-        debug_assert!((index as usize) < self.lookup.len());
-        let string_in_chunk = unsafe { self.lookup.get_unchecked_mut(index as usize) };
+        let string_in_chunk = unsafe { self.lookup.get_unchecked_mut_dbg(index as usize) };
         debug_assert!((string_in_chunk.offset + string_in_chunk.length) <= data_size);
 
         // Fill the now empty space with garbage.
