@@ -9,3 +9,6 @@ edition = "2018"
 [dependencies]
 minimultimap = { path = "../minimultimap" }
 miniunchecked = { path = "../miniunchecked" }
+
+[dev-dependencies]
+static_assertions = "1.1.*"

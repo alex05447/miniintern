@@ -9,7 +9,7 @@ use {
 /// determines the maximum length in bytes of the string which can be interned in the chunk by the [`string pool`].
 /// Strings longer than this are allocated on the heap individually.
 ///
-/// NOTE - when changing the underlying type, also change the `StringOffset` / `StringLength` / `LookupIndex` types.
+/// NOTE - when changing the underlying type, also change the `Offset` / `Length` / `LookupIndex` types.
 pub type ChunkSize = NonZeroU16;
 
 pub(crate) type ChunkSizeInternal = u16;
@@ -78,7 +78,7 @@ pub(crate) struct Chunk {
     /// The chunk's string data buffer.
     /// Points past the chunk's header.
     /// The string pool knows its size and passes it down when necessary.
-    data: *mut u8,
+    data: NonNull<u8>,
     /// Num of bytes in `data` array containing string bytes.
     occupied_bytes: ChunkSizeInternal,
     /// First free byte in the `data` array.
@@ -109,19 +109,21 @@ impl Chunk {
             } else {
                 0
             },
-        )
-        .as_ptr();
+        );
 
         // Create the chunk's header, passing it the offset data buffer pointer,
         // and write the header at the start of the buffer.
 
-        let data = unsafe { ptr.offset(STRING_CHUNK_HEADER_SIZE as _) };
+        let data =
+            unsafe { NonNull::new_unchecked(ptr.as_ptr().offset(STRING_CHUNK_HEADER_SIZE as _)) };
 
         let chunk = Self::new(data);
 
-        unsafe { std::ptr::write_unaligned(ptr as _, chunk) };
+        let chunk_ptr = ptr.as_ptr() as *mut Chunk;
 
-        unsafe { NonNull::new_unchecked(ptr as _) }
+        unsafe { std::ptr::write_unaligned(chunk_ptr, chunk) };
+
+        unsafe { NonNull::new_unchecked(chunk_ptr) }
     }
 
     /// Cleans up and frees the `Chunk`.
@@ -152,6 +154,7 @@ impl Chunk {
         }
 
         let offset = self.first_free_byte;
+        debug_assert!(offset < data_size);
 
         // Get the lookup index from the free list, or allocate a new element.
         let lookup_index = if self.first_free_index != INVALID_INDEX {
@@ -180,11 +183,11 @@ impl Chunk {
             self.fragmented = true;
         }
 
-        // COpy the string's data into the allocated space in the chunk.
+        // Copy the string's data into the allocated space in the chunk.
         let src = string.as_bytes().as_ptr();
-        let dst = unsafe { self.data.offset(offset as _) };
 
         unsafe {
+            let dst = self.ptr(offset);
             std::ptr::copy_nonoverlapping(src, dst, length as _);
         }
 
@@ -198,9 +201,8 @@ impl Chunk {
     ///
     /// NOTE - the caller guarantees `lookup_index` is valid, so the call always succeeds.
     pub(crate) fn lookup(&self, lookup_index: LookupIndex, data_size: ChunkSizeInternal) -> &str {
-        // Lookup the string's offset/lenght in the chunk using its stable `lookup_index`.
-        let lookup_index = lookup_index as usize;
-        let string_in_chunk = unsafe { self.lookup.get_unchecked_dbg(lookup_index) };
+        // Lookup the string's offset/length in the chunk using its stable `lookup_index`.
+        let string_in_chunk = unsafe { self.lookup.get_unchecked_dbg(lookup_index as usize) };
 
         debug_assert!(
             (string_in_chunk.offset + string_in_chunk.length) <= data_size,
@@ -208,8 +210,10 @@ impl Chunk {
         );
 
         unsafe {
-            let src = self.data.offset(string_in_chunk.offset as isize);
-            let slice = std::slice::from_raw_parts(src, string_in_chunk.length as usize);
+            let slice = std::slice::from_raw_parts(
+                self.ptr(string_in_chunk.offset),
+                string_in_chunk.length as _,
+            );
             if cfg!(debug_assertions) {
                 std::str::from_utf8(slice).unwrap()
             } else {
@@ -233,14 +237,6 @@ impl Chunk {
         let string_in_chunk = unsafe { self.lookup.get_unchecked_mut_dbg(index as usize) };
         debug_assert!((string_in_chunk.offset + string_in_chunk.length) <= data_size);
 
-        // Fill the now empty space with garbage.
-        if cfg!(debug_assertions) {
-            unsafe {
-                let dst = self.data.offset(string_in_chunk.offset as _);
-                std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, string_in_chunk.length as _);
-            }
-        }
-
         debug_assert!(self.occupied_bytes >= string_in_chunk.length);
         self.occupied_bytes -= string_in_chunk.length;
 
@@ -253,6 +249,15 @@ impl Chunk {
         string_in_chunk.length = INVALID_LENGTH;
         self.first_free_index = index;
 
+        // Fill the now empty space with garbage.
+        if cfg!(debug_assertions) {
+            let offset = string_in_chunk.offset;
+            let length = string_in_chunk.length;
+            unsafe {
+                std::ptr::write_bytes(self.ptr(offset), CHUNK_FILL_VALUE, length as _);
+            }
+        }
+
         // Defragment if <50% occupied and not already defragmented.
         if self.needs_to_defragment(data_size) {
             self.defragment(data_size, offsets);
@@ -261,7 +266,7 @@ impl Chunk {
         RemoveResult::ChunkInUse
     }
 
-    fn new(data: *mut u8) -> Self {
+    fn new(data: NonNull<u8>) -> Self {
         Self {
             data,
             occupied_bytes: 0,
@@ -289,7 +294,7 @@ impl Chunk {
         debug_assert!(offsets.is_empty());
         offsets.extend(self.lookup.iter().filter_map(|string_in_chunk| {
             // Skip the free entries.
-            (string_in_chunk.length != INVALID_LENGTH).then(|| (*string_in_chunk, 0))
+            (string_in_chunk.length != INVALID_LENGTH).then_some((*string_in_chunk, 0))
         }));
 
         // Sanity check - string lengths must add up to chunk's occupied bytes.
@@ -302,21 +307,22 @@ impl Chunk {
         offsets.sort_by(|l, r| l.0.offset.cmp(&r.0.offset));
 
         // Compact.
-        let mut offset = 0;
+        let mut compact_offset = 0;
 
         for (string_in_chunk, new_offset) in offsets.iter_mut() {
             unsafe {
-                let src = self.data.offset(string_in_chunk.offset as _);
-                let dst = self.data.offset(offset as _);
-
                 // May overlap.
-                std::ptr::copy(src, dst, string_in_chunk.length as _);
+                std::ptr::copy(
+                    self.ptr(string_in_chunk.offset),
+                    self.ptr(compact_offset as _),
+                    string_in_chunk.length as _,
+                );
 
-                *new_offset = offset;
-                offset += string_in_chunk.length;
+                *new_offset = compact_offset;
+                compact_offset += string_in_chunk.length;
             }
         }
-        debug_assert_eq!(offset, self.occupied_bytes);
+        debug_assert_eq!(compact_offset, self.occupied_bytes);
 
         // Move the free pointer back.
         self.first_free_byte = self.occupied_bytes;
@@ -327,8 +333,11 @@ impl Chunk {
 
             if remaining_bytes > 0 {
                 unsafe {
-                    let dst = self.data.offset(self.first_free_byte as isize);
-                    std::ptr::write_bytes(dst, CHUNK_FILL_VALUE, remaining_bytes as usize);
+                    std::ptr::write_bytes(
+                        self.ptr(self.first_free_byte),
+                        CHUNK_FILL_VALUE,
+                        remaining_bytes as _,
+                    );
                 }
             }
         }
@@ -349,6 +358,10 @@ impl Chunk {
 
         self.fragmented = false;
     }
+
+    unsafe fn ptr(&self, offset: Offset) -> *mut u8 {
+        unsafe { self.data.as_ptr().offset(offset as _) }
+    }
 }
 
 fn malloc(size: usize, val: u8) -> NonNull<u8> {
@@ -365,12 +378,12 @@ fn free(ptr: NonNull<u8>, size: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, static_assertions::*};
 
     #[test]
     fn string_chunk() {
         const SMALL_CHUNK_DATA_SIZE: ChunkSizeInternal = 8;
-        assert!(SMALL_CHUNK_DATA_SIZE < STRING_CHUNK_HEADER_SIZE);
+        const_assert!(SMALL_CHUNK_DATA_SIZE < STRING_CHUNK_HEADER_SIZE);
         const SMALL_CHUNK_SIZE: ChunkSizeInternal =
             SMALL_CHUNK_DATA_SIZE + STRING_CHUNK_HEADER_SIZE;
 
@@ -526,7 +539,7 @@ mod tests {
         Chunk::free(chunk, SMALL_CHUNK_SIZE);
 
         const LARGE_CHUNK_SIZE: ChunkSizeInternal = 256;
-        assert!(LARGE_CHUNK_SIZE > STRING_CHUNK_HEADER_SIZE);
+        const_assert!(LARGE_CHUNK_SIZE > STRING_CHUNK_HEADER_SIZE);
 
         const LARGE_CHUNK_DATA_SIZE: ChunkSizeInternal =
             LARGE_CHUNK_SIZE - STRING_CHUNK_HEADER_SIZE;

@@ -214,7 +214,7 @@ impl Pool {
     /// - Returns an [`error`](Error::RefCountOverflow) if the string's ref count overflows.
     /// - Returns an [`error`](Error::StringCountOverflow) if the total string count overflows.
     pub fn intern<'s, S: Into<Cow<'s, str>>>(&mut self, string: S) -> Result<ID, Error> {
-        if self.num_strings >= MAX_NUM_STRINGS {
+        if self.num_strings == MAX_NUM_STRINGS {
             return Err(Error::StringCountOverflow(MAX_NUM_STRINGS as _));
         }
 
@@ -232,60 +232,61 @@ impl Pool {
         // Hash the string.
         let hash = string_hash_fnv1a(string);
 
-        // The string(s) with this hash was (were) interned
-        // (but might have been `remove_gc`'d and not yet `gc`'d).
-        let generation = if let Some(mut strings) = self.lookup.entry(hash) {
-            for string_state in strings.iter_mut() {
-                // Look up the string in the chunk.
-                let looked_up_string = string_state.lookup(data_size);
+        let generation = match self.lookup.entry(hash) {
+            // The string(s) with this hash was (were) interned
+            // (but might have been `remove_gc`'d and not yet `gc`'d).
+            Entry::Occupied(mut entry) => {
+                for string_state in entry.get_mut() {
+                    // Look up the string in the chunk.
+                    let looked_up_string = string_state.lookup(data_size);
 
-                // The strings are the same - increment the ref count and return the existing `ID`.
-                if string == looked_up_string {
-                    // NOTE - ref count might have been `0` if the string was `remove_gc`'d and not yet `gc`'d -
-                    // `gc` will skip strings with non-`0` ref counts.
-                    string_state.ref_count = string_state
-                        .ref_count
-                        .checked_add(1)
-                        .ok_or(Error::RefCountOverflow(RefCount::MAX as _))?;
+                    // The strings are the same - increment the ref count and return the existing `ID`.
+                    if string == looked_up_string {
+                        // NOTE - ref count might have been `0` if the string was `remove_gc`'d and not yet `gc`'d -
+                        // `gc` will skip strings with non-`0` ref counts.
+                        string_state.ref_count = string_state
+                            .ref_count
+                            .checked_add(1)
+                            .ok_or(Error::RefCountOverflow(RefCount::MAX as _))?;
 
-                    return Ok(ID {
-                        hash,
-                        generation: string_state.generation,
-                    });
+                        return Ok(ID {
+                            hash,
+                            generation: string_state.generation,
+                        });
+                    }
                 }
+
+                // (Cold case) None of the strings match - we've got a hash collision.
+                // Must intern with a new `ID`.
+                let (new_state, generation) = Self::intern_new_string(
+                    cow,
+                    &mut self.last_used_chunk,
+                    &mut self.chunks,
+                    &mut self.num_strings,
+                    &mut self.generation,
+                    self.chunk_size,
+                );
+
+                entry.push(new_state);
+
+                generation
             }
-
-            // (Cold case) None of the strings match - we've got a hash collision.
-            // Must intern with a new `ID`.
-            let (new_state, generation) = Self::intern_new_string(
-                cow,
-                &mut self.last_used_chunk,
-                &mut self.chunks,
-                &mut self.num_strings,
-                &mut self.generation,
-                self.chunk_size,
-            );
-
-            strings.insert(new_state);
-
-            generation
-
             // Else the string with this hash has not been interned yet.
             // Intern it and return the new `ID`.
-        } else {
-            let (new_state, generation) = Self::intern_new_string(
-                cow,
-                &mut self.last_used_chunk,
-                &mut self.chunks,
-                &mut self.num_strings,
-                &mut self.generation,
-                self.chunk_size,
-            );
+            Entry::Vacant(entry) => {
+                let (new_state, generation) = Self::intern_new_string(
+                    cow,
+                    &mut self.last_used_chunk,
+                    &mut self.chunks,
+                    &mut self.num_strings,
+                    &mut self.generation,
+                    self.chunk_size,
+                );
 
-            let _none = self.lookup.insert(hash, new_state);
-            debug_assert_eq!(_none, 0);
+                entry.insert(new_state);
 
-            generation
+                generation
+            }
         };
 
         Ok(ID { hash, generation })
@@ -307,10 +308,15 @@ impl Pool {
     pub fn copy(&mut self, id: ID) -> Result<(), Error> {
         if let Some(string) = self
             .lookup
-            .get_iter_mut(&id.hash)
-            // Generations match - the `id` is valid
-            // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
-            .find(|string| string.generation == id.generation)
+            .get_mut(&id.hash)
+            .map(|strings| {
+                // Generations match - the `id` is valid
+                // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
+                strings
+                    .iter_mut()
+                    .find(|string| string.generation == id.generation)
+            })
+            .flatten()
         {
             // Increment the ref count.
             // NOTE - ref count might have been `0` if the string was `remove_gc`'d and not yet `gc`'d -
@@ -331,9 +337,14 @@ impl Pool {
     /// Returns `None` if the string [`id`](ID) is not valid.
     pub fn lookup(&self, id: ID) -> Option<&str> {
         self.lookup
-            .get_iter(&id.hash)
-            .filter_map(|string| self.lookup_in_state(string, id.generation))
-            .next()
+            .get(&id.hash)
+            .map(|strings| {
+                strings
+                    .iter()
+                    .filter_map(|string| self.lookup_in_state(string, id.generation))
+                    .next()
+            })
+            .flatten()
     }
 
     /// Looks up a previously [`intern`](Pool::intern)'ed string via its string [`id`](ID).
@@ -408,7 +419,7 @@ impl Pool {
                         return Ok(());
                     }
                 }
-                // Mismatched generations - the `id` is for a hash-colliding string, is stale (or even from a different string pool).
+                // Mismatched generations - the `id` is for a hash-colliding string, is stale, or even is from a different string pool.
             }
         }
 
@@ -439,16 +450,16 @@ impl Pool {
     /// Returns an iterator over all ([`id`](ID), `&str`) tuples for all strings interned in the [`Pool`].
     pub fn iter(&self) -> impl Iterator<Item = (ID, &'_ str)> {
         StringPoolIter {
-            pool: &self,
+            pool: self,
             iter: self.lookup.multi_iter(),
         }
     }
 
-    fn intern_new_string<'s>(
-        cow: Cow<'s, str>,
+    fn intern_new_string(
+        cow: Cow<'_, str>,
         last_used_chunk: &mut Option<NonNull<Chunk>>,
         string_chunks: &mut Vec<NonNull<Chunk>>,
-        num_strings: &mut u32,
+        num_strings: &mut NumStrings,
         generation: &mut Generation,
         chunk_size: ChunkSizeInternal,
     ) -> (State, Generation) {
@@ -466,8 +477,10 @@ impl Pool {
         let string = &cow;
         let len = string.len();
 
+        let data_size = Self::data_size(chunk_size);
+
         // If the string is too large for our chunk size, allocate it on the heap and return it.
-        if len > Self::data_size(chunk_size) as usize {
+        if len > data_size as _ {
             let state = State::new_string(cur_generation, cow.into_owned());
 
             increment_counters();
@@ -478,7 +491,7 @@ impl Pool {
         let mut intern_in_chunk =
             |mut string_chunk: NonNull<Chunk>| -> Option<(State, Generation)> {
                 if let InternResult::Interned(lookup_index) =
-                    unsafe { string_chunk.as_mut() }.intern(string, Self::data_size(chunk_size))
+                    unsafe { string_chunk.as_mut() }.intern(string, data_size)
                 {
                     let state = State::new_chunk(cur_generation, string_chunk, lookup_index);
 
@@ -521,7 +534,10 @@ impl Pool {
         string_chunks.push(new_chunk);
 
         // Must succeed - the chunk is guaranteed to have enough space.
-        let res = unsafe { intern_in_chunk(new_chunk).unwrap_unchecked_dbg() };
+        let res = unsafe {
+            intern_in_chunk(new_chunk)
+                .unwrap_unchecked_dbg_msg("failed to intern a string in a newly allocated chunk")
+        };
         // Update the `last_used_chunk`.
         *last_used_chunk = Some(new_chunk);
         res
@@ -536,50 +552,54 @@ impl Pool {
         chunk_size: ChunkSizeInternal,
         offsets: &mut Vec<(StringInChunk, Offset)>,
     ) -> Result<(), Error> {
-        // The string with this hash was interned (but might have been `remove_gc`'d and not yet `gc`'d).
-        if let Some(mut strings) = lookup.entry(id.hash) {
-            for (index, string) in strings.iter_mut().enumerate() {
-                // Generations match - the `id` is valid
-                // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
-                if string.generation == id.generation {
-                    if !gc {
-                        // Attempted to remove a stale `id` which was `remove_gc`'d and not yet `gc`'d.
+        match lookup.entry(id.hash) {
+            // The string with this hash was interned (but might have been `remove_gc`'d and not yet `gc`'d).
+            Entry::Occupied(mut entry) => {
+                for (index, string) in entry.get_mut().iter_mut().enumerate() {
+                    // Generations match - the `id` is valid
+                    // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
+                    if string.generation == id.generation {
+                        if !gc {
+                            // Attempted to remove a stale `id` which was `remove_gc`'d and not yet `gc`'d.
+                            if string.ref_count == 0 {
+                                return Err(Error::InvalidStringID);
+                            }
+
+                            // Decrement the ref count.
+                            string.ref_count -= 1;
+                        }
+
+                        // `remove_gc`'d and about to be `gc`'d,
+                        // or this was the last use of this string when the ref count decremented above.
                         if string.ref_count == 0 {
-                            return Err(Error::InvalidStringID);
+                            if let Storage::Chunk(string_state) = &string.storage {
+                                Self::remove_string_from_chunk(
+                                    string_state.chunk,
+                                    string_state.index,
+                                    chunks,
+                                    num_strings,
+                                    gc,
+                                    chunk_size,
+                                    offsets,
+                                );
+                            }
+
+                            // Remove the string from the state array.
+                            let _removed = entry.remove_at(index);
+                            debug_assert!(_removed.is_ok());
                         }
 
-                        // Decrement the ref count.
-                        string.ref_count -= 1;
+                        // Else the string might've been re-interned / copied
+                        // before we garbage collected it.
+
+                        return Ok(());
                     }
 
-                    // `remove_gc`'d and about to be `gc`'d,
-                    // or this was the last use of this string when the ref count decremented above.
-                    if string.ref_count == 0 {
-                        if let Storage::Chunk(string_state) = &string.storage {
-                            Self::remove_string_from_chunk(
-                                string_state.chunk,
-                                string_state.index,
-                                chunks,
-                                num_strings,
-                                gc,
-                                chunk_size,
-                                offsets,
-                            );
-                        }
-
-                        // Remove the string from the state array.
-                        unsafe { strings.remove_unchecked(index) };
-                    }
-
-                    // Else the string might've been re-interned / copied
-                    // before we garbage collected it.
-
-                    return Ok(());
+                    // Else, mismatched generations - the `id` is for a hash-colliding string,
+                    // or is stale (or even from a different string pool).
                 }
-
-                // Else, mismatched generations - the `id` is for a hash-colliding string,
-                // or is stale (or even from a different string pool).
             }
+            Entry::Vacant(_) => {}
         }
 
         // Else no string with this hash was interned (or was already removed);
@@ -599,7 +619,9 @@ impl Pool {
         let chunk = unsafe { chunk_ptr.as_mut() };
 
         // This was the last string in the chunk and it's now empty - free it.
-        if let RemoveResult::ChunkFree = chunk.remove(index, Self::data_size(chunk_size), offsets) {
+        if let crate::RemoveResult::ChunkFree =
+            chunk.remove(index, Self::data_size(chunk_size), offsets)
+        {
             Chunk::free(chunk_ptr, chunk_size);
             chunks.retain(|chunk| *chunk != chunk_ptr);
         }
@@ -613,33 +635,28 @@ impl Pool {
     /// Returns the maximum useful length in bytes of the string chunk of `chunk_size`
     /// (i.e. accounts for the string header overhead).
     fn data_size(chunk_size: ChunkSizeInternal) -> ChunkSizeInternal {
-        debug_assert!(chunk_size > STRING_CHUNK_HEADER_SIZE);
+        debug_assert!(chunk_size >= STRING_CHUNK_HEADER_SIZE);
         chunk_size - STRING_CHUNK_HEADER_SIZE
     }
 
     fn lookup_in_state<'a>(&self, state: &'a State, generation: Generation) -> Option<&'a str> {
         // Generations match - the `id` is valid
         // (or the generation counter overflowed - but we assume this will never happen; 4 billion unique strings should be enough for everyone).
-        if state.generation == generation {
-            self.lookup_in_state_impl(state).map(|(string, _)| string)
-
-            // Else, mismatched generations - the `id` is for a hash-colliding string,
-            // or is stale (or even from a different string pool).
-        } else {
-            None
-        }
+        // Else, mismatched generations - the `id` is for a hash-colliding string,
+        // or is stale (or even from a different string pool).
+        (state.generation == generation)
+            .then(|| self.lookup_in_state_impl(state).map(|(string, _)| string))
+            .flatten()
     }
 
     fn lookup_in_state_impl<'a>(&self, state: &'a State) -> Option<(&'a str, Generation)> {
-        if state.ref_count > 0 {
-            Some((
+        // If ref count is `0`, we attempted to look up a stale `id` which was `remove_gc`'d and not yet `gc`'d.
+        (state.ref_count > 0).then(|| {
+            (
                 state.lookup(Self::data_size(self.chunk_size)),
                 state.generation,
-            ))
-        // Attempted to look up a stale `id` which was `remove_gc`'d and not yet `gc`'d.
-        } else {
-            None
-        }
+            )
+        })
     }
 }
 

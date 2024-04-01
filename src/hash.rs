@@ -7,7 +7,7 @@ pub(crate) fn string_hash_fnv1a(string: &str) -> Hash {
     let mut hash = FNV_OFFSET;
 
     for byte in string.bytes() {
-        hash = hash ^ byte as Hash;
+        hash ^= byte as Hash;
         hash = hash.overflowing_mul(FNV_PRIME).0;
     }
 
