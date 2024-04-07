@@ -6,8 +6,6 @@ use std::{
 /// An error returned by the [`Pool`](crate::Pool).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error {
-    /// Attempted to [`intern`](crate::Pool::intern) an empty (zero-length) string.
-    EmptyString,
     /// `ID` was invalid.
     InvalidStringID,
     /// String reference counter overflowed.
@@ -25,7 +23,6 @@ impl Display for Error {
         use Error::*;
 
         match self {
-            EmptyString => "attempted to intern an empty (zero-length) string".fmt(f),
             InvalidStringID => "string id was invalid".fmt(f),
             RefCountOverflow(max_num_copies) => write!(
                 f,

@@ -113,7 +113,7 @@ another thread is holding on to a recently returned string, now pointing to garg
 This is the purpose of `remove_gc()` / `gc()` methods. `remove_gc()` does not defragment the `Pool` immediately, but `gc()` must be called later at a point when only one thread accesses the `Pool` and no other threads hold on to looked up strings.
 
 - in any thread, obtain (write) lock, intern with `intern()`,
-- in any thread, obtain (read) lock, lookup with `lookup()`,
+- in any thread, obtain (read) lock, lookup with `lookup_unsafe()`,
 - in any thread, obtain (write) lock, remove with `remove_gc()`,
 - in some (probably main) thread, when no looked up strings are held by other threads,
 obtain (write) lock, garbage collect with `gc()`.
